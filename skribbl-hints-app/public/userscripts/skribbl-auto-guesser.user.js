@@ -4680,31 +4680,47 @@
       }
     }
   
-    function renderTopCandidates() {
+    function filterCandidates(query) {
+      if (!query.trim()) {
+        return state.candidates.slice(0, LIMITS.candidatePreview);
+      }
+      const q = query.toLowerCase();
+      return state.candidates.filter(word => word.toLowerCase().includes(q)).slice(0, LIMITS.candidatePreview);
+    }
+
+    function renderTopCandidates(filteredCandidates = null) {
       if (!state.ui?.candidateTop) return;
   
-      const top = state.candidates.slice(0, LIMITS.candidatePreview);
-      if (!top.length) {
-        state.ui.candidateTop.textContent = '—';
+      const candidates = filteredCandidates || state.candidates.slice(0, LIMITS.candidatePreview);
+      if (!candidates.length) {
+        state.ui.candidateTop.innerHTML = '<div style="padding:8px;text-align:center;color:#999;">No matches</div>';
         return;
       }
   
       state.ui.candidateTop.innerHTML = '';
-      for (const word of top) {
-        const chip = document.createElement('button');
-        chip.type = 'button';
-        chip.className = 'sag-candidate-chip';
-        chip.textContent = word;
-        chip.addEventListener('click', async () => {
+      const container = document.createElement('div');
+      container.style.cssText = 'max-height:300px;overflow-y:auto;border:1px solid #e5e7eb;border-radius:4px;';
+      
+      candidates.forEach((word, index) => {
+        const row = document.createElement('div');
+        row.style.cssText = 'display:flex;align-items:center;padding:6px;border-bottom:1px solid #f0f0f0;hover:background:#f9fafb;cursor:pointer;';
+        row.innerHTML = `
+          <span style="min-width:20px;color:#999;font-size:10px;margin-right:8px;">${index + 1}</span>
+          <span style="flex:1;word-break:break-all;">${word}</span>
+          <button class="sag-word-copy" style="padding:2px 6px;font-size:10px;margin-left:4px;">Copy</button>
+        `;
+        
+        row.addEventListener('click', () => sendGuess(word));
+        row.querySelector('.sag-word-copy').addEventListener('click', async (e) => {
+          e.stopPropagation();
           const copied = await copyTextToClipboard(word);
-          chip.classList.remove('copied');
-          void chip.offsetWidth;
-          chip.classList.add('copied');
-          setTimeout(() => chip.classList.remove('copied'), 420);
-          setStatus(copied ? `Copied: ${word}` : `Copy failed: ${word}`, !copied);
+          setStatus(copied ? 'Copied' : 'Copy failed', !copied);
         });
-        state.ui.candidateTop.appendChild(chip);
-      }
+        
+        container.appendChild(row);
+      });
+      
+      state.ui.candidateTop.appendChild(container);
     }
   
     function attachObservers() {
@@ -4880,6 +4896,33 @@
           border-color: #15803d !important;
           color: #ffffff !important;
         }
+        #skribbl-auto-guesser-panel #sag-search-input {
+          width: 100%;
+          padding: 6px 8px;
+          font-size: 12px;
+          margin-bottom: 6px;
+          border: 1px solid #d0d7de !important;
+          border-radius: 4px;
+        }
+        #skribbl-auto-guesser-panel #sag-search-hint {
+          font-size: 10px;
+          color: #666;
+          margin-bottom: 4px;
+        }
+        #skribbl-auto-guesser-panel .sag-word-row {
+          padding: 6px;
+          border-bottom: 1px solid #f0f0f0;
+          cursor: pointer;
+          transition: background 0.2s;
+        }
+        #skribbl-auto-guesser-panel .sag-word-row:hover {
+          background: #f9fafb;
+        }
+        #skribbl-auto-guesser-panel .sag-word-copy {
+          padding: 2px 6px !important;
+          font-size: 10px !important;
+          background: #f0f0f0 !important;
+        }
       `;
       document.head.appendChild(style);
   
@@ -4906,6 +4949,12 @@
             <button id="sag-remove-word" style="padding:4px 8px;">Remove</button>
             <button id="sag-dedupe" style="padding:4px 8px;">Dedupe</button>
           </div>
+
+          <div id="sag-search-section" style="margin-bottom:8px;">
+            <input id="sag-search-input" type="text" placeholder="Search words (type 1-9 or Enter to send)" />
+            <div id="sag-search-hint" style="display:none;">Press 1-9 for first 9 results, Enter for first result</div>
+            <span id="sag-candidate-top">—</span>
+          </div>
   
           <div style="font-size:11px;display:grid;grid-template-columns:120px 1fr;gap:3px 6px;word-break:break-word;">
             <span>Status</span><span id="sag-status">Idle</span>
@@ -4914,7 +4963,6 @@
             <span>Letter pattern</span><span id="sag-letter-pattern">—</span>
             <span>Word list size</span><span id="sag-word-count">0</span>
             <span>Candidate count</span><span id="sag-candidate-count">0</span>
-            <span>Top candidates</span><span id="sag-candidate-top">—</span>
             <span>Last sent guess</span><span id="sag-last-guess">—</span>
             <span>Mode</span><span id="sag-mode">stopped</span>
             <span>Game phase</span><span id="sag-phase">unknown</span>
@@ -4977,6 +5025,44 @@
       });
       panel.querySelector('#sag-dedupe').addEventListener('click', () => {
         dedupeWordList();
+      });
+
+      const searchInput = panel.querySelector('#sag-search-input');
+      const searchHint = panel.querySelector('#sag-search-hint');
+      let currentSearchResults = [];
+
+      searchInput.addEventListener('input', (e) => {
+        const query = e.target.value;
+        if (query.trim()) {
+          currentSearchResults = filterCandidates(query);
+          renderTopCandidates(currentSearchResults);
+          searchHint.style.display = 'block';
+        } else {
+          currentSearchResults = [];
+          renderTopCandidates();
+          searchHint.style.display = 'none';
+        }
+      });
+
+      searchInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && currentSearchResults.length > 0) {
+          e.preventDefault();
+          sendGuess(currentSearchResults[0]);
+          searchInput.value = '';
+          currentSearchResults = [];
+          renderTopCandidates();
+          searchHint.style.display = 'none';
+        } else if (e.key >= '1' && e.key <= '9' && currentSearchResults.length > 0) {
+          e.preventDefault();
+          const index = parseInt(e.key) - 1;
+          if (index < currentSearchResults.length) {
+            sendGuess(currentSearchResults[index]);
+            searchInput.value = '';
+            currentSearchResults = [];
+            renderTopCandidates();
+            searchHint.style.display = 'none';
+          }
+        }
       });
   
       state.ui = {
