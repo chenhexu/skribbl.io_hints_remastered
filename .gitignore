@@ -42,12 +42,13 @@ venv/
 env/
 ENV/
 
-# Backup files
-backup-page.txt
-words-backup.json
-custom-words-backup.json
+# Backup files (stored in backups/ folder)
+backups/
 
-# Scripts
+# Tools and data files (stored in tools/ folder)
+tools/newwordList.txt
+
+# Start scripts
 start-skribbl.ps1
 start-skribbl.bat
 
