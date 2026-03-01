@@ -24,7 +24,7 @@
     const LIMITS = {
       delayMin: 0,
       delayMax: 8000,
-      candidatePreview: 12,
+      candidatePreview: 999999,
       maxRetries: 5,
       queueBurstLimit: 1200,
       spamCooldownMs: 1200,
@@ -3765,6 +3765,8 @@
       lastError: '',
       wordCount: 0,
       loopTimer: null,
+      wordGuessedThisRound: false,
+      isUserScrolling: false,
       selectors: {
         input: null,
         send: null,
@@ -4090,7 +4092,7 @@
     async function loadWords() {
       try {
         const cached = JSON.parse(localStorage.getItem(WORD_CACHE_KEY) || 'null');
-        if (cached && Array.isArray(cached.words) && cached.words.length > 1000) {
+        if (cached && Array.isArray(cached.words) && cached.words.length > 3000) {
           state.words = uniqueCaseInsensitive(cached.words);
           state.wordCount = state.words.length;
           state.wordsLoaded = state.words.length > 0;
@@ -4107,7 +4109,7 @@
         'https://cdn.jsdelivr.net/gh/Sv443/skribblio-word-lists@master/en_words.txt',
       ];
   
-      const merged = [...BUNDLED_WORDS, 'SUV'];
+      const merged = [...BUNDLED_WORDS];
   
       for (const url of urls) {
         try {
@@ -4389,14 +4391,24 @@
       const { hint, underscorePattern, letterPattern } = parseHint(rawHint);
       state.currentUnderscorePattern = underscorePattern;
       state.currentLetterPattern = letterPattern;
-  
+
       if (!isAutomationAllowed()) {
         state.candidates = [];
         state.queue = [];
         renderDebug(`${reason} (${state.lastGamePhase})`);
         return;
       }
-  
+
+      if (underscorePattern && underscorePattern.length > 0 && !underscorePattern.includes('_') && !state.wordGuessedThisRound) {
+        state.wordGuessedThisRound = true;
+      }
+
+      if (state.wordGuessedThisRound) {
+        hideCandidates();
+        renderDebug(reason);
+        return;
+      }
+
       let candidates = state.words.slice();
   
       if (letterPattern) {
@@ -4414,6 +4426,7 @@
       }
   
       renderDebug(reason);
+      renderTopCandidates();
     }
   
     function buildQueueFromCandidates(options = {}) {
@@ -4607,6 +4620,7 @@
       state.closeHitPending = null;
       state.queue = [];
       state.lastGuess = '';
+      state.wordGuessedThisRound = false;
       if (state.ui) {
         state.ui.lastGuess.textContent = '—';
       }
@@ -4649,7 +4663,31 @@
       }
   
       if (/\bthe word was\b|\bround over\b|\bis drawing now\b|\bis choosing a word\b|\bchoose a word\b|\bpick a word\b/.test(recent)) {
+        state.wordGuessedThisRound = true;
         resetRoundState('Word/round transition detected');
+      }
+
+      extractAndTrackGuessedWords(recent);
+    }
+
+    function extractAndTrackGuessedWords(chatText) {
+      const wordPattern = /(?:guessed the word|said:|:)\s+([a-z\s\-']+)/gi;
+      let match;
+      let guessedCount = 0;
+
+      while ((match = wordPattern.exec(chatText)) !== null) {
+        const guessedWord = match[1].trim().toLowerCase();
+        if (guessedWord && guessedWord.length > 1 && !guessedWord.includes('guessed') && !guessedWord.includes('said')) {
+          const normalized = normalizeWord(guessedWord);
+          if (!state.sentThisRound.has(normalized)) {
+            state.sentThisRound.add(normalized);
+            guessedCount++;
+          }
+        }
+      }
+
+      if (guessedCount > 0) {
+        renderTopCandidates();
       }
     }
   
@@ -4680,47 +4718,99 @@
       }
     }
   
-    function filterCandidates(query) {
-      if (!query.trim()) {
-        return state.candidates.slice(0, LIMITS.candidatePreview);
+    function hideCandidates() {
+      if (state.ui?.candidateTop) {
+        state.ui.candidateTop.innerHTML = '<div style="padding:8px;text-align:center;color:#999;font-size:10px;">Word guessed! Waiting for next round...</div>';
       }
-      const q = query.toLowerCase();
-      return state.candidates.filter(word => word.toLowerCase().includes(q)).slice(0, LIMITS.candidatePreview);
     }
 
-    function renderTopCandidates(filteredCandidates = null) {
+    function filterCandidates(query) {
+      if (!query.trim()) {
+        return state.candidates.filter(w => !state.sentThisRound.has(normalizeWord(w))).slice(0, LIMITS.candidatePreview);
+      }
+      const q = query.toLowerCase();
+      return state.candidates.filter(word => {
+        const normalized = normalizeWord(word);
+        return word.toLowerCase().includes(q) && !state.sentThisRound.has(normalized);
+      }).slice(0, LIMITS.candidatePreview);
+    }
+
+    function renderTopCandidates(filteredCandidates = null, keepSearchActive = false) {
       if (!state.ui?.candidateTop) return;
   
-      const candidates = filteredCandidates || state.candidates.slice(0, LIMITS.candidatePreview);
+      const candidates = filteredCandidates || filterCandidates('');
       if (!candidates.length) {
-        state.ui.candidateTop.innerHTML = '<div style="padding:8px;text-align:center;color:#999;">No matches</div>';
+        state.ui.candidateTop.innerHTML = '<div style="padding:8px;text-align:center;color:#999;font-size:10px;">No matches</div>';
         return;
       }
   
+      const existingContainer = state.ui.candidateTop.querySelector('div');
+      const savedScrollTop = existingContainer ? existingContainer.scrollTop : 0;
+      
       state.ui.candidateTop.innerHTML = '';
       const container = document.createElement('div');
-      container.style.cssText = 'max-height:300px;overflow-y:auto;border:1px solid #e5e7eb;border-radius:4px;';
+      container.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fit,minmax(70px,1fr));gap:6px;height:162px;overflow-y:scroll;padding:6px;border:1px solid #e5e7eb;border-radius:4px;align-content:start;';
+      
+      container.addEventListener('scroll', () => {
+        state.isUserScrolling = true;
+        clearTimeout(container.scrollTimeout);
+        container.scrollTimeout = setTimeout(() => {
+          state.isUserScrolling = false;
+        }, 500);
+      });
       
       candidates.forEach((word, index) => {
-        const row = document.createElement('div');
-        row.style.cssText = 'display:flex;align-items:center;padding:6px;border-bottom:1px solid #f0f0f0;hover:background:#f9fafb;cursor:pointer;';
-        row.innerHTML = `
-          <span style="min-width:20px;color:#999;font-size:10px;margin-right:8px;">${index + 1}</span>
-          <span style="flex:1;word-break:break-all;">${word}</span>
-          <button class="sag-word-copy" style="padding:2px 6px;font-size:10px;margin-left:4px;">Copy</button>
-        `;
+        const wordLength = word.length;
+        let fontSize, padding, minHeight;
         
-        row.addEventListener('click', () => sendGuess(word));
-        row.querySelector('.sag-word-copy').addEventListener('click', async (e) => {
-          e.stopPropagation();
-          const copied = await copyTextToClipboard(word);
-          setStatus(copied ? 'Copied' : 'Copy failed', !copied);
+        if (wordLength < 5) {
+          fontSize = '13px';
+          padding = '6px';
+          minHeight = '32px';
+        } else if (wordLength < 8) {
+          fontSize = '11px';
+          padding = '6px';
+          minHeight = '32px';
+        } else if (wordLength < 12) {
+          fontSize = '9px';
+          padding = '6px';
+          minHeight = '36px';
+        } else if (wordLength < 16) {
+          fontSize = '8px';
+          padding = '8px';
+          minHeight = '40px';
+        } else {
+          fontSize = '7px';
+          padding = '8px';
+          minHeight = '44px';
+        }
+        
+        const box = document.createElement('button');
+        box.type = 'button';
+        box.style.cssText = `padding:${padding};font-size:${fontSize};border:1px solid #cbd5e1;border-radius:3px;background:#f8fafc;cursor:pointer;word-break:break-word;text-align:center;line-height:1.2;color:#111827;font-weight:500;min-height:${minHeight};`;
+        box.textContent = word;
+        box.title = `${index + 1}. ${word}`;
+        
+        box.addEventListener('mouseenter', () => {
+          box.style.background = '#e5e7eb';
+        });
+        box.addEventListener('mouseleave', () => {
+          box.style.background = '#f8fafc';
         });
         
-        container.appendChild(row);
+        box.addEventListener('click', () => {
+          sendGuess(word);
+          state.sentThisRound.add(normalizeWord(word));
+          if (!keepSearchActive) {
+            renderTopCandidates();
+          }
+        });
+        
+        container.appendChild(box);
       });
       
       state.ui.candidateTop.appendChild(container);
+      container.scrollTop = savedScrollTop;
     }
   
     function attachObservers() {
@@ -4746,9 +4836,17 @@
           const roundText = (document.querySelector('.round')?.textContent || '').trim();
           const phase = getGamePhase();
           const token = `${roundText}::${phase}`;
+          
           if (state.roundToken && token !== state.roundToken && /between-words|between-rounds|choosing/.test(phase)) {
             resetRoundState('Word/round DOM changed');
           }
+          
+          if (!state.roundToken || token !== state.roundToken) {
+            if (/guessing|playing/.test(phase)) {
+              refreshCandidates('round-phase-change-guessing');
+            }
+          }
+          
           state.roundToken = token;
         });
         state.observers.round.observe(state.selectors.roundRoot, { childList: true, subtree: true });
@@ -4762,7 +4860,6 @@
       state.ui.letterPattern.textContent = state.currentLetterPattern || '—';
       state.ui.wordCount.textContent = String(state.wordCount || state.words.length || 0);
       state.ui.candidateCount.textContent = String(state.candidates.length);
-      renderTopCandidates();
       state.ui.mode.textContent = state.running ? 'running' : 'stopped';
       state.ui.phase.textContent = state.lastGamePhase || 'unknown';
       state.ui.closeState.textContent = state.closeHitPending ? `pending: ${state.closeHitPending}` : 'none';
@@ -4779,11 +4876,20 @@
         if (!dragging) return;
         const x = e.clientX - startX;
         const y = e.clientY - startY;
-        panel.style.left = `${Math.max(0, x)}px`;
-        panel.style.top = `${Math.max(0, y)}px`;
+        
+        const panelWidth = panel.offsetWidth;
+        const panelHeight = panel.offsetHeight;
+        const maxX = Math.max(0, window.innerWidth - panelWidth);
+        const maxY = Math.max(0, window.innerHeight - panelHeight);
+        
+        const constrainedX = Math.max(0, Math.min(x, maxX));
+        const constrainedY = Math.max(0, Math.min(y, maxY));
+        
+        panel.style.left = `${constrainedX}px`;
+        panel.style.top = `${constrainedY}px`;
         panel.style.right = 'auto';
-        settings.panelX = Math.max(0, x);
-        settings.panelY = Math.max(0, y);
+        settings.panelX = constrainedX;
+        settings.panelY = constrainedY;
         saveSettings();
       };
   
@@ -4802,6 +4908,32 @@
         window.addEventListener('mouseup', onUp);
         e.preventDefault();
       });
+    }
+
+    function ensurePanelVisible(panel) {
+      const panelWidth = panel.offsetWidth || 320;
+      const panelHeight = panel.offsetHeight || 400;
+      const viewportWidth = window.innerWidth;
+      const viewportHeight = window.innerHeight;
+      
+      let x = settings.panelX != null ? settings.panelX : 0;
+      let y = settings.panelY != null ? settings.panelY : 0;
+      
+      if (x + panelWidth > viewportWidth) {
+        x = Math.max(0, viewportWidth - panelWidth - 10);
+      }
+      if (y + panelHeight > viewportHeight) {
+        y = Math.max(0, viewportHeight - panelHeight - 10);
+      }
+      if (x < 0) x = 0;
+      if (y < 0) y = 0;
+      
+      panel.style.left = `${x}px`;
+      panel.style.top = `${y}px`;
+      panel.style.right = 'auto';
+      settings.panelX = x;
+      settings.panelY = y;
+      saveSettings();
     }
   
     function createPanel() {
@@ -4974,6 +5106,7 @@
       `;
   
       document.body.appendChild(panel);
+      ensurePanelVisible(panel);
   
       const header = panel.querySelector('#sag-header');
       makeDraggable(panel, header);
@@ -5030,15 +5163,18 @@
       const searchInput = panel.querySelector('#sag-search-input');
       const searchHint = panel.querySelector('#sag-search-hint');
       let currentSearchResults = [];
+      let lastSearchQuery = '';
 
       searchInput.addEventListener('input', (e) => {
         const query = e.target.value;
+        lastSearchQuery = query;
         if (query.trim()) {
           currentSearchResults = filterCandidates(query);
           renderTopCandidates(currentSearchResults);
           searchHint.style.display = 'block';
         } else {
           currentSearchResults = [];
+          lastSearchQuery = '';
           renderTopCandidates();
           searchHint.style.display = 'none';
         }
@@ -5047,20 +5183,34 @@
       searchInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && currentSearchResults.length > 0) {
           e.preventDefault();
-          sendGuess(currentSearchResults[0]);
-          searchInput.value = '';
-          currentSearchResults = [];
-          renderTopCandidates();
-          searchHint.style.display = 'none';
+          const word = currentSearchResults[0];
+          state.sentThisRound.add(normalizeWord(word));
+          sendGuess(word);
+          setTimeout(() => {
+            searchInput.focus();
+            if (lastSearchQuery) {
+              searchInput.value = lastSearchQuery;
+              currentSearchResults = filterCandidates(lastSearchQuery);
+              renderTopCandidates(currentSearchResults);
+              searchHint.style.display = 'block';
+            }
+          }, 100);
         } else if (e.key >= '1' && e.key <= '9' && currentSearchResults.length > 0) {
           e.preventDefault();
           const index = parseInt(e.key) - 1;
           if (index < currentSearchResults.length) {
-            sendGuess(currentSearchResults[index]);
-            searchInput.value = '';
-            currentSearchResults = [];
-            renderTopCandidates();
-            searchHint.style.display = 'none';
+            const word = currentSearchResults[index];
+            state.sentThisRound.add(normalizeWord(word));
+            sendGuess(word);
+            setTimeout(() => {
+              searchInput.focus();
+              if (lastSearchQuery) {
+                searchInput.value = lastSearchQuery;
+                currentSearchResults = filterCandidates(lastSearchQuery);
+                renderTopCandidates(currentSearchResults);
+                searchHint.style.display = 'block';
+              }
+            }, 100);
           }
         }
       });
@@ -5106,6 +5256,21 @@
       }
   
       state.initialized = true;
+
+      if (state.ui?.panel) {
+        ensurePanelVisible(state.ui.panel);
+      }
+
+      let lastRenderedHint = '';
+      setInterval(() => {
+        if (state.initialized && state.ui && !state.wordGuessedThisRound && !state.isUserScrolling) {
+          const currentHint = getHintText() || '';
+          if (currentHint && currentHint !== lastRenderedHint) {
+            lastRenderedHint = currentHint;
+            refreshCandidates('auto-refresh-hint-change');
+          }
+        }
+      }, 100);
     }
   
     onReady(async () => {

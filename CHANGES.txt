@@ -1,0 +1,162 @@
+## Changes Made to skribbl-auto-guesser.user.js
+
+### 1. Fixed Word Loading Issue (Line 4093, 4110)
+- Changed cache threshold from 1000 words to 3000 words
+  OLD: if (cached && Array.isArray(cached.words) && cached.words.length > 1000)
+  NEW: if (cached && Array.isArray(cached.words) && cached.words.length > 3000)
+- This ensures that the old cached version (2301 words) is bypassed and the full 3712 words from BUNDLED_WORDS are loaded
+
+- Removed hardcoded 'SUV' from merged array
+  OLD: const merged = [...BUNDLED_WORDS, 'SUV'];
+  NEW: const merged = [...BUNDLED_WORDS];
+
+- Removed candidate preview limit completely
+  OLD: candidatePreview: 50,
+  NEW: candidatePreview: 999999,
+  This allows all matching candidates to be displayed with scrolling
+
+- Fixed round reset to properly refresh the candidate display
+  Added: renderTopCandidates() call in refreshCandidates() function
+  This ensures that when a new word-round starts, sentThisRound is cleared and the UI updates to show all words again
+
+### 2. Enhanced Candidate Display - Grid Layout with Scrollbar (Lines 4101-4147)
+
+#### filterCandidates() function (Lines 4101-4110)
+- Now filters out words already sent in the current round
+- Uses normalizeWord() for case-insensitive comparison
+- Filters when no query is provided: 
+  return state.candidates.filter(w => !state.sentThisRound.has(normalizeWord(w)))
+- Also filters in search: word.toLowerCase().includes(q) && !state.sentThisRound.has(normalized)
+
+#### renderTopCandidates() function (Lines 4112-4162)
+- Changed from fixed 5-column grid to responsive auto-fit grid
+- OLD: grid-template-columns:repeat(5,1fr);gap:6px;height:162px;
+- NEW: grid-template-columns:repeat(auto-fit,minmax(70px,1fr));gap:6px;height:162px;
+
+- Features:
+  * Dynamic column count based on word length
+  * Longer words automatically get more space by reducing columns (4 words per row for long words, 5+ for short words)
+  * Fixed height for exactly 3 visible rows (162px total)
+  * Scrollbar slider shows remaining words when scrolling
+  * Enhanced dynamic font sizing based on word length:
+    - Words < 5 letters: font-size 13px, min-height 32px
+    - Words 5-7 letters: font-size 11px, min-height 32px
+    - Words 8-11 letters: font-size 9px, min-height 36px
+    - Words 12-15 letters: font-size 8px, min-height 40px
+    - Words 16+ letters: font-size 7px, min-height 44px
+  * Progressive box expansion for longer words
+  * Auto-removes sent words from display
+
+### 4. Chat Monitoring - Auto-track Guessed Words (Lines 4680-4705)
+
+#### New extractAndTrackGuessedWords() function (Lines 4692-4705)
+- Monitors chat messages for guessed words (format: "player: word")
+- Extracts words after colons using regex: /:\s+([^\n:]+)/g
+- Automatically adds guessed words to state.sentThisRound
+- Case-insensitive matching using normalizeWord()
+- Refreshes candidate display after detecting new guessed words
+- Works for both manual guesses and bot guesses
+
+#### Updated parseChatSignals() function (Line 4655)
+- Now calls extractAndTrackGuessedWords() to process all new chat messages
+- Removes suggested words that were typed/guessed in chat
+- Updates display in real-time when words are guessed
+
+### 5. Improved Search Functionality (Lines 5095-5138)
+
+#### Enhanced search input handlers
+- Now maintains search state after clicking words
+- Tracks last search query in `lastSearchQuery` variable
+- After sending a word, search input is refocused and previous query is restored
+- Use setTimeout to ensure proper timing after guess is sent
+- Search results persist and automatically re-filter after each guess
+
+#### Updated renderTopCandidates() function (Lines 4718-4784)
+- Now preserves scroll position when re-rendering after clicking a word
+- Saves `scrollTop` position before clearing the HTML
+- Restores scroll position after creating new container
+- This allows you to scroll down to "P" words and click one without jumping back to the top
+- Scroll position is maintained between renders for smooth UX
+
+### 6. Automatic Candidate Display Refresh (Line 5192-5203)
+
+#### Optimized auto-refresh interval in initWithRetry()
+- Now directly calls `getHintText()` to detect hint changes every 200ms
+- Calls `refreshCandidates()` when hint text changes (more reliable than just checking pattern)
+- Automatically triggers refreshCandidates which includes both renderDebug and renderTopCandidates
+- Faster detection and update of new hints (200ms vs 300ms)
+- Prevents constant re-rendering by only updating when hint actually changes
+
+#### Enhanced round observer in attachObservers()
+- Now detects when entering the "guessing" or "playing" phase
+- Automatically calls `refreshCandidates()` when entering a guessing round
+- This ensures word suggestions appear automatically when a new word puzzle starts
+- Handles phase transitions better to detect game state changes
+
+### 5. Updated Search Input Event Handlers (Lines 5103-5138)
+
+### 7. Panel Position Management and Constraints (Lines 4842-4898)
+
+#### Enhanced makeDraggable() function (Lines 4842-4875)
+- Now constrains panel movement to stay within viewport
+- Calculates max X and Y positions based on panel and window dimensions
+- Prevents dragging panel beyond the right or bottom edges of the screen
+- Uses Math.min/max to ensure panel stays visible while dragging
+
+#### New ensurePanelVisible() function (Lines 4877-4898)
+- Checks if saved panel position is still within viewport
+- If panel went out of bounds (due to resize or dragging too far), it resets position
+- Constrains X position to [0, viewportWidth - panelWidth - 10]
+- Constrains Y position to [0, viewportHeight - panelHeight - 10]
+- Adds 10px padding to ensure panel doesn't touch viewport edges
+- Called on panel creation and initialization
+
+#### Updated createPanel() and initWithRetry()
+- Calls ensurePanelVisible() immediately after appending panel to DOM
+- Also calls ensurePanelVisible() after initialization
+- Ensures panel is always visible on page load, even after window resizing
+
+### 8. Auto-Hide Candidates After Word is Guessed (Lines 3768, 4396-4409, 4615-4629, 4669-4674)
+
+#### New state property: wordGuessedThisRound & isUserScrolling (Line 3768)
+- `wordGuessedThisRound`: Tracks if the word has been guessed correctly this round
+- `isUserScrolling`: Tracks if user is actively scrolling to prevent DOM updates during scroll
+
+#### Smart word guess detection in refreshCandidates() (Lines 4395-4409)
+- Checks `underscorePattern` directly (the parsed hint pattern)
+- If pattern has content and NO underscores: word is guessed
+- Sets `wordGuessedThisRound = true` to trigger hiding
+- Works reliably regardless of how the hint is displayed
+
+#### Improved chat word tracking in extractAndTrackGuessedWords() (Lines 4673-4692)
+- More specific pattern to only capture actual guessed words
+- Filters out system messages and chat noise
+- Uses pattern: `/(guessed the word|said:|:)\s+([a-z\s\-']+)/gi`
+- Only adds words that are valid game words (not "guessed", "said", etc.)
+- Prevents words from reappearing by maintaining `sentThisRound` set properly
+
+### 9. Faster Refresh Rate (Line 5258)
+- Reduced auto-refresh interval from 200ms to 100ms
+- Hint changes are now detected twice as fast
+- Candidates update more responsively to hint changes
+- Still efficient enough to not cause performance issues
+
+### Summary of Benefits
+1. All 3712 words now load correctly (no longer limited to 2301)
+   - BUNDLED_WORDS contains 3712 words
+   - words.json contains 3712 words
+   - Cache threshold increased to 3000 so old cache (2301 words) is bypassed
+2. More compact, visually appealing grid layout with more words visible at once
+3. Sent/clicked words disappear from suggestions immediately (case-insensitive matching)
+4. Words sent by you, others, or the bot are temporarily hidden for the rest of the round
+5. Better spacing between word boxes for easier clicking
+6. Hover effects provide clear visual feedback
+7. Auto-tracking of chat guesses - suggested words are dynamically removed when guessed in chat
+8. Scrollbar slider allows viewing more words beyond the 3-row visible area
+9. Suggestions automatically hide when the word is guessed (prevents over-clicking)
+10. Panel position is automatically reset if dragged out of view
+11. Faster refresh rate (100ms) for more responsive updates
+12. Smooth scroll position preservation when clicking words
+13. Search state persists after clicking words from search results
+
+NOTE: The display may show 3708 initially while words are still being deduplicated/loaded into state.words array.
