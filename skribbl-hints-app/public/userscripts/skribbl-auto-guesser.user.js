@@ -17,9 +17,23 @@
       dotPrefix: true,
       panelX: null,
       panelY: null,
+      panelWidth: 320,
+      panelHeight: null,
       collapsed: false,
       corner: 'top-right',
+      refreshRateMs: 100,
+      closeHitScanMs: 20,
+      devPanelOpen: false,
+      devPanelX: null,
+      devPanelY: null,
+      detailsCollapsed: false,
+      devPanelWidth: 300,
+      devPanelHeight: 420,
     };
+
+    const PANEL_SIZE = { minWidth: 260, minHeight: 200, maxWidth: 1400, maxHeight: 1200 };
+    const DEV_PANEL_SIZE = { minWidth: 260, minHeight: 280, maxWidth: 1000, maxHeight: 1200 };
+    const SCRIPT_VERSION = 'v1.0.1';
   
     const LIMITS = {
       delayMin: 0,
@@ -29,6 +43,13 @@
       queueBurstLimit: 1200,
       spamCooldownMs: 1200,
       tickPollMs: 150,
+      refreshRateMin: 50,
+      refreshRateMax: 2000,
+      closeHitScanMin: 10,
+      closeHitScanMax: 200,
+      closeHitScanTimeout: 500,
+      devLogMax: 80,
+      minGuessLength: 3,
     };
   
     const BUNDLED_WORDS = [
@@ -3753,6 +3774,7 @@
       currentHintRaw: '',
       currentUnderscorePattern: '',
       currentLetterPattern: '',
+      lastProcessedHint: '',
       candidates: [],
       queue: [],
       sentThisRound: new Set(),
@@ -3766,6 +3788,7 @@
       wordCount: 0,
       loopTimer: null,
       wordGuessedThisRound: false,
+      wordGuessedAt: 0,
       isUserScrolling: false,
       selectors: {
         input: null,
@@ -3785,8 +3808,19 @@
       lastGamePhase: 'unknown',
       selfName: '',
       lastChatTextLen: 0,
+      roundStartChatLen: 0,
       spamBlockedUntil: 0,
       cooldownRemainingMs: 0,
+      spamDetectedCount: 0,
+      closeHitSent: new Set(),
+      revealedWords: new Set(),
+      devLog: [],
+      refreshRateMs: null,
+      refreshLoopScheduled: null,
+      renderTopCandidatesRaf: null,
+      renderTopCandidatesPending: null,
+      closeHitWatchTimer: null,
+      closeHitWatchStop: null,
     };
   
     function loadSettings() {
@@ -4270,19 +4304,30 @@
   
     function getSelfName() {
       if (state.selfName) return state.selfName;
-  
-      const youNode = Array.from(document.querySelectorAll('div,span,li')).find((el) =>
-        /\(you\)/i.test(el.textContent || '')
-      );
-  
-      if (!youNode) return '';
-  
+
+      // Collect all elements that contain "(you)" anywhere in their text
+      const candidates = Array.from(document.querySelectorAll('div,span,li,p'))
+        .filter(el => /\(you\)/i.test(el.textContent || ''));
+
+      if (!candidates.length) return '';
+
+      // The most specific element is the shortest one — avoids grabbing a huge parent container
+      candidates.sort((a, b) => (a.textContent || '').length - (b.textContent || '').length);
+      const youNode = candidates[0];
+
       const raw = (youNode.textContent || '')
-        .replace(/\(you\)/ig, '')
+        .replace(/\(you\)/ig, '')      // remove "(you)" label
+        .replace(/\d+\s*points?/ig, '') // remove "40 points"
+        .replace(/#\d+/g, '')           // remove "#1375" rank suffixes
         .replace(/\s+/g, ' ')
         .trim();
-  
-      state.selfName = raw.toLowerCase();
+
+      if (!raw) return '';
+
+      // If we still ended up with a long string (wrong element), take just the first word
+      const name = raw.length > 40 ? raw.split(/\s+/)[0] : raw;
+
+      state.selfName = name.toLowerCase();
       return state.selfName;
     }
   
@@ -4399,15 +4444,31 @@
         return;
       }
 
-      if (underscorePattern && underscorePattern.length > 0 && !underscorePattern.includes('_') && !state.wordGuessedThisRound) {
-        state.wordGuessedThisRound = true;
-      }
-
       if (state.wordGuessedThisRound) {
+        // isAutomationAllowed() passed above, meaning phase === 'guessing'.
+        // Only auto-recover after a grace period: skribbl stays in "guessing" phase
+        // while other players are still guessing the same word, so we must not
+        // mistake that window for a missed round transition.
+        const gracePassed = Date.now() - state.wordGuessedAt > 10000;
+        if (gracePassed && rawHint && /_/.test(rawHint)) {
+          devLog('round', `Auto-recovering: guessing phase while word-guessed (hint: "${rawHint}")`);
+          startNewRound();
+          return;
+        }
         hideCandidates();
         renderDebug(reason);
         return;
       }
+
+      const hintChanged = rawHint !== state.lastProcessedHint;
+
+      if (hintChanged) {
+        devLog('hint', `Hint changed: "${state.lastProcessedHint || '—'}" → "${rawHint || '—'}"`);
+      }
+
+      // NOTE: do NOT clear revealedWords here yet — queue build below depends on it.
+      // We clear it AFTER the queue is built so the previous round's word is still blocked.
+      state.lastProcessedHint = rawHint;
 
       let candidates = state.words.slice();
   
@@ -4422,7 +4483,17 @@
       state.candidates = rankCandidates(uniqueCaseInsensitive(candidates), hint).slice(0, LIMITS.queueBurstLimit);
   
       if (state.running) {
-        buildQueueFromCandidates();
+        buildQueueFromCandidates({ preserveExisting: !hintChanged });
+        // If the tick loop died (e.g. resetRoundState cleared loopTimer), restart it now that
+        // the queue has been freshly populated. startAutomation will override this if it runs next.
+        if (state.queue.length > 0 && !state.loopTimer) {
+          scheduleNextTick(Math.max(60, Math.min(getConfiguredDelay(), 300)));
+        }
+      }
+
+      // Clear revealedWords AFTER the queue is built so revealed words are blocked on the first build.
+      if (hintChanged && /_/.test(rawHint)) {
+        state.revealedWords.clear();
       }
   
       renderDebug(reason);
@@ -4437,9 +4508,10 @@
   
       for (const word of state.candidates) {
         const n = normalizeWord(word);
-        if (!n) continue;
+        if (!n || n.length < LIMITS.minGuessLength) continue;
+        if (!isValidGuessText(n)) continue;
         if (state.sentThisRound.has(n) || (state.sentAttempts.get(n) || 0) > 0) continue;
-        if (queuedSet.has(n)) continue;
+        if (state.revealedWords.has(n) || queuedSet.has(n)) continue;
         queue.push(n);
         queuedSet.add(n);
       }
@@ -4455,6 +4527,7 @@
       }
       setStatus(reason);
       renderDebug('stopped');
+      devLog('info', `Automation stopped: ${reason}`);
     }
   
     function setNativeValue(element, value) {
@@ -4471,15 +4544,112 @@
       }
     }
   
-    function sendGuess(text) {
+    function canSendWithoutSpamKick() {
+      if (state.spamDetectedCount >= 2) return false;
+      if (Date.now() < state.spamBlockedUntil) return false;
+      return true;
+    }
+
+    function isValidGuessText(text) {
+      const t = (text || '').trim();
+      if (t.length < LIMITS.minGuessLength) return false;
+      if (/[\r\n]/.test(t)) return false;
+      if (t.includes(':')) return false;
+      if (/\b(guessed the word|is drawing now|left the room|joined the room)\b/i.test(t)) return false;
+      return true;
+    }
+
+    // ── Close-hit watcher ──────────────────────────────────────────────────────
+    // Activated immediately when a dot-prefixed word is sent. Polls the last 3
+    // chat DOM elements every closeHitScanMs ms for up to closeHitScanTimeout ms.
+    // Much more reliable than waiting for a chat MutationObserver delta because it
+    // reads individual message elements directly, so rapid chat can't bury the signal.
+    function stopCloseHitWatch() {
+      if (state.closeHitWatchTimer) {
+        clearInterval(state.closeHitWatchTimer);
+        state.closeHitWatchTimer = null;
+      }
+      if (state.closeHitWatchStop) {
+        clearTimeout(state.closeHitWatchStop);
+        state.closeHitWatchStop = null;
+      }
+    }
+
+    function startCloseHitWatch(word) {
+      stopCloseHitWatch();
+      if (!settings.dotPrefix) return;
+
+      const cleaned = (word || '').replace(/^\./, '').trim();
+      const normalized = normalizeWord(cleaned);
+      if (!normalized || normalized.length < LIMITS.minGuessLength) return;
+      if (state.closeHitSent.has(normalized)) return;
+
+      const scanMs = Math.max(LIMITS.closeHitScanMin, Math.min(LIMITS.closeHitScanMax, settings.closeHitScanMs ?? DEFAULT_SETTINGS.closeHitScanMs));
+
+      const tryDetect = () => {
+        if (state.wordGuessedThisRound || state.closeHitSent.has(normalized) || !state.selectors.chat) {
+          stopCloseHitWatch();
+          return;
+        }
+        // Check last 3 chat message elements individually so rapid chat can't bury the line
+        const children = Array.from(state.selectors.chat.children).slice(-3);
+        const recentText = children.map(el => el.textContent || '').join('\n');
+        const closeMatch = recentText.match(/\s*(?:\.)?([^\s.!?,]+(?:\s+[^\s.!?,]+)*)\s+is\s+close!/i);
+        if (closeMatch) {
+          const found = normalizeWord((closeMatch[1] || '').replace(/^\.+/, ''));
+          if (found === normalized) {
+            stopCloseHitWatch();
+            devLog('chat', `Close-hit (watcher): "${cleaned}" — resending without dot`);
+            if (canSendWithoutSpamKick()) {
+              if (sendGuess(cleaned, { noDot: true })) {
+                state.closeHitSent.add(normalized);
+                state.closeHitPending = null;
+                renderTopCandidates();
+              }
+            } else {
+              enqueueCloseRetry(cleaned);
+            }
+          }
+        }
+      };
+
+      state.closeHitWatchTimer = setInterval(tryDetect, scanMs);
+      state.closeHitWatchStop = setTimeout(stopCloseHitWatch, LIMITS.closeHitScanTimeout);
+    }
+    // ── End close-hit watcher ─────────────────────────────────────────────────
+
+    function sendGuess(text, options) {
+      options = options || {};
+      const trimmed = (text || '').trim();
+      if (trimmed.length < LIMITS.minGuessLength) {
+        return false;
+      }
+      if (!isValidGuessText(trimmed)) {
+        return false;
+      }
       const input = state.selectors.input;
       if (!input || input.disabled || input.readOnly) {
         setStatus('Chat input not found/usable', true);
         return false;
       }
-  
+
+      if (!canSendWithoutSpamKick()) {
+        setStatus('Blocked: spam risk (2+ detections)', true);
+        return false;
+      }
+
+      let out = trimmed;
+      if (!options.noDot) {
+        if (settings.dotPrefix && out && !out.startsWith('.')) out = '.' + out;
+        else if (!settings.dotPrefix && out && out.startsWith('.')) out = out.slice(1);
+      } else if (out && out.startsWith('.')) {
+        out = out.slice(1);
+      }
+
       input.focus();
-      setNativeValue(input, text);
+      setNativeValue(input, '');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      setNativeValue(input, out);
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new Event('change', { bubbles: true }));
   
@@ -4501,8 +4671,18 @@
         state.selectors.send.click();
       }
   
-      state.lastGuess = text;
-      state.ui.lastGuess.textContent = text || '—';
+      state.lastGuess = out;
+      state.ui.lastGuess.textContent = out || '—';
+      state.sentThisRound.add(normalizeWord(out.replace(/^\./, '')));
+      devLog('guess', `Sent: "${out}"`);
+
+      // If we just sent a dot-prefixed word, immediately start the dedicated close-hit
+      // watcher. It polls individual chat DOM elements every closeHitScanMs ms so it
+      // can't miss the ".word is close!" message even when chat is moving fast.
+      if (settings.dotPrefix && !options.noDot && out.startsWith('.')) {
+        startCloseHitWatch(trimmed);
+      }
+
       return true;
     }
   
@@ -4513,9 +4693,18 @@
       if (retries >= LIMITS.maxRetries) return;
       state.retryMap.set(n, retries + 1);
       state.closeHitPending = n;
-      if (state.running && !state.loopTimer) {
-        tickQueue(false);
+      if (!state.running) return;
+      const waitForCooldown = state.spamBlockedUntil > Date.now() ? Math.min(state.spamBlockedUntil - Date.now() + 50, 2000) : 0;
+      const soonMs = Math.max(200, Math.min(500, getConfiguredDelay()));
+      const waitMs = waitForCooldown > 0 ? Math.min(waitForCooldown, LIMITS.tickPollMs) : soonMs;
+      if (state.loopTimer) {
+        clearTimeout(state.loopTimer);
+        state.loopTimer = null;
       }
+      state.loopTimer = setTimeout(() => {
+        state.loopTimer = null;
+        tickQueue(false);
+      }, waitMs);
     }
   
   
@@ -4538,16 +4727,17 @@
   
     function tickQueue(immediate = false) {
       if (!state.running) return;
+      if (state.wordGuessedThisRound) return;
       const delay = getConfiguredDelay();
   
-      if (Date.now() < state.spamBlockedUntil) {
-        state.cooldownRemainingMs = Math.max(0, state.spamBlockedUntil - Date.now());
-        setStatus(`Running (paused: spam ${Math.ceil(state.cooldownRemainingMs / 1000)}s)`);
+      if (!canSendWithoutSpamKick()) {
+        state.cooldownRemainingMs = state.spamBlockedUntil > Date.now() ? Math.max(0, state.spamBlockedUntil - Date.now()) : 0;
+        setStatus(state.spamDetectedCount >= 2 ? 'Paused: spam risk (avoid 3rd strike)' : `Running (paused: spam ${Math.ceil(state.cooldownRemainingMs / 1000)}s)`);
         renderDebug('spam cooldown');
         scheduleNextTick(Math.min(LIMITS.tickPollMs, Math.max(50, delay)));
         return;
       }
-  
+
       state.cooldownRemainingMs = 0;
   
       if (!isAutomationAllowed()) {
@@ -4560,12 +4750,21 @@
       if (state.closeHitPending) {
         const word = state.closeHitPending;
         state.closeHitPending = null;
-        if (sendGuess(word)) {
-          state.sentThisRound.add(word);
-          setStatus(`Close-hit retry sent: ${word}`);
+        if (sendGuess(word, { noDot: true })) {
+          state.closeHitSent.add(normalizeWord(word));
+          setStatus(`Close-hit retry sent (no dot): ${word}`);
         }
       } else {
-        const next = state.queue.shift();
+        let next = state.queue.shift();
+        while (next && (
+          next.length < LIMITS.minGuessLength ||
+          !next.trim() ||
+          !isValidGuessText(next) ||
+          state.revealedWords.has(normalizeWord(next)) ||
+          state.sentThisRound.has(normalizeWord(next))
+        )) {
+          next = state.queue.shift();
+        }
         if (!next) {
           refreshCandidates('queue empty');
           setStatus('Running (paused: waiting for new letters/word)');
@@ -4573,14 +4772,13 @@
           scheduleNextTick(Math.min(LIMITS.tickPollMs, Math.max(80, delay)));
           return;
         }
-  
-        const payload = settings.dotPrefix ? `.${next}` : next;
+
         state.sentAttempts.set(next, (state.sentAttempts.get(next) || 0) + 1);
-        state.sentThisRound.add(next);
-        if (sendGuess(payload)) {
-          setStatus(`Sent guess: ${payload}`);
+        if (sendGuess(next)) {
+          setStatus(`Sent guess: ${settings.dotPrefix ? '.' + next : next}`);
+          renderTopCandidates();
         } else {
-          setStatus(`Send failed, skipped: ${payload}`, true);
+          setStatus(`Send failed, skipped: ${next}`, true);
         }
       }
   
@@ -4594,7 +4792,7 @@
         setStatus('Words still loading...', true);
         return;
       }
-  
+
       if (!state.selectors.input) {
         bindGameSelectors();
         if (!state.selectors.input) {
@@ -4602,11 +4800,22 @@
           return;
         }
       }
-  
+
+      state.wordGuessedThisRound = false;
       state.running = true;
       state.automationArmed = true;
+      state.queue = [];
+      state.sentAttempts.clear();
+      state.closeHitPending = null;
+      // Anchor close-hit scanning to the current chat position so the poller and
+      // round-scan fallback never look at messages from before the bot was started.
+      if (state.selectors.chat) {
+        const chatLen = (state.selectors.chat.textContent || '').length;
+        if (chatLen > state.roundStartChatLen) state.roundStartChatLen = chatLen;
+        if (chatLen > state.lastChatTextLen) state.lastChatTextLen = chatLen;
+      }
+      devLog('info', `Automation started — ${state.candidates.length} candidates, hint: "${state.currentHintRaw || '—'}"`);
       refreshCandidates('start');
-      buildQueueFromCandidates({ preserveExisting: state.queue.length > 0 });
       setStatus('Running');
       renderDebug('running');
       const kickoffDelay = Math.max(60, Math.min(getConfiguredDelay(), 500));
@@ -4614,27 +4823,55 @@
     }
   
     function resetRoundState(reason = 'Round reset') {
+      if (state.loopTimer) {
+        clearTimeout(state.loopTimer);
+        state.loopTimer = null;
+      }
+      // Stop any in-flight close-hit watcher so it doesn't fire into the new round.
+      stopCloseHitWatch();
+      // Mark where in the chat this round starts so the close-hit fallback only
+      // scans the current round's messages and won't re-fire on previous rounds.
+      state.roundStartChatLen = state.lastChatTextLen;
       state.sentThisRound.clear();
+      // Carry revealed words into sentThisRound so they stay blocked for the new round's queue builds
+      state.revealedWords.forEach(w => state.sentThisRound.add(w));
+      state.closeHitSent.clear();
       state.sentAttempts.clear();
       state.retryMap.clear();
       state.closeHitPending = null;
       state.queue = [];
       state.lastGuess = '';
-      state.wordGuessedThisRound = false;
+      state.lastProcessedHint = '';
+      state.selfName = ''; // re-detect name each round in case it changed
       if (state.ui) {
         state.ui.lastGuess.textContent = '—';
       }
       if (state.running) {
         setStatus(`Running (paused: ${reason.toLowerCase()})`);
       }
-      refreshCandidates(reason);
+      if (!state.wordGuessedThisRound) {
+        refreshCandidates(reason);
+      } else {
+        renderDebug(reason);
+      }
+    }
+
+    function startNewRound() {
+      state.wordGuessedThisRound = false;
+      state.spamDetectedCount = 0;
+      state.spamBlockedUntil = 0;
+      state.cooldownRemainingMs = 0;
+      devLog('round', 'New round started — resetting state');
+      resetRoundState('New round');
     }
   
     function parseChatSignals(rootText) {
       const fullText = rootText || '';
   
       if (fullText.length < state.lastChatTextLen) {
-        state.lastChatTextLen = 0;
+        // Chat was cleared or re-rendered — reset position without reprocessing history
+        state.lastChatTextLen = fullText.length;
+        return;
       }
   
       const delta = fullText.slice(state.lastChatTextLen);
@@ -4643,52 +4880,175 @@
       if (!recent.trim()) return;
   
       if (/spam detected|sending messages too quickly/.test(recent)) {
-        state.spamBlockedUntil = Date.now() + LIMITS.spamCooldownMs;
-        setStatus('Running (paused: spam cooldown)');
+        state.spamDetectedCount = (state.spamDetectedCount || 0) + 1;
+        // Exponential backoff: 3s → 7s → stop.  Each strike doubles the wait so the
+        // bot can't recover quickly enough to trigger the server kick on the 3rd strike.
+        const backoff = Math.min(2000 * (1 << state.spamDetectedCount), 12000); // 4s, 8s, 12s cap
+        state.spamBlockedUntil = Date.now() + backoff;
+        if (state.spamDetectedCount >= 2) {
+          // Two strikes — stop the automation completely; user can restart manually.
+          devLog('round', `Spam risk: ${state.spamDetectedCount} detections — stopping to avoid kick`);
+          stopAutomation('Spam risk: stopped to avoid kick');
+        } else {
+          setStatus(`Running (paused: spam cooldown ${Math.ceil(backoff / 1000)}s)`);
+        }
         return;
       }
   
-      const ownName = getSelfName();
-      const ownSolved = /you guessed the word!/i.test(recent) ||
-        (ownName && new RegExp(`\\b${escapeRegExp(ownName)}\\s+guessed the word!`, 'i').test(recent));
-  
-      if (ownSolved && state.running) {
-        stopAutomation('Solved word detected, stopped');
-        return;
-      }
-  
-      const close = recent.match(/\.([^\s.!?,]+(?:\s+[^\s.!?,]+)*)\s+is close!/i);
-      if (close && close[1]) {
-        enqueueCloseRetry(close[1]);
-      }
-  
-      if (/\bthe word was\b|\bround over\b|\bis drawing now\b|\bis choosing a word\b|\bchoose a word\b|\bpick a word\b/.test(recent)) {
+      // System message "The word was 'X'" is NOT preceded by "name: "
+      // A user typing it would appear as "name: the word was 'X'" (with a colon)
+      const isRoundEndSystemMessage = (text) => {
+        const lc = (text || '').toLowerCase();
+        const idx = lc.indexOf("the word was '");
+        if (idx !== -1) {
+          const before = lc.slice(Math.max(0, idx - 12), idx);
+          if (!before.includes(':')) return true;
+        }
+        return /\bround over\b/i.test(text);
+      };
+      if (/\bthe word was\b|\bround over\b/.test(recent) && isRoundEndSystemMessage(recent)) {
+        const revealedWords = [];
+        const wordWasRe = /\bthe word was\s*'([^']+)'/gi;
+        let m;
+        while ((m = wordWasRe.exec(fullText)) !== null) {
+          const w = normalizeWord(m[1]);
+          if (w && w.length >= LIMITS.minGuessLength) revealedWords.push(w);
+        }
+        revealedWords.forEach((w) => {
+          state.closeHitSent.add(w);
+          state.revealedWords.add(w);
+        });
+        if (state.closeHitPending && revealedWords.includes(normalizeWord(state.closeHitPending))) {
+          state.closeHitPending = null;
+        }
         state.wordGuessedThisRound = true;
-        resetRoundState('Word/round transition detected');
+        state.wordGuessedAt = Date.now();
+        devLog('round', 'Round ended — "the word was" / "round over" detected');
+        hideCandidates();
+        if (/\bis drawing now\b|\bis choosing a word\b|\bchoose a word\b|\bpick a word\b/.test(recent)) {
+          startNewRound();
+        }
+        return;
+      }
+  
+      // ── Close-hit detection ──────────────────────────────────────────────────
+      // IMPORTANT: this block runs BEFORE the ownSolved check so that when Skribbl
+      // delivers ".word is close!" and "bugatti guessed the word!" in the SAME DOM
+      // mutation batch, we still process (and send) the close-hit resend first.
+      // tryCloseHitSend guards against sending after round end via wordGuessedThisRound.
+      function tryCloseHitSend(text) {
+        if (state.wordGuessedThisRound) return false;
+        const close = (text || '').match(/\s*(?:\.)?([^\s.!?,]+(?:\s+[^\s.!?,]+)*)\s+is\s+close!/i);
+        if (!close || !close[1]) return false;
+        const word = close[1].trim().replace(/^\.+/, '');
+        const normalized = normalizeWord(word);
+        if (!normalized || normalized.length < LIMITS.minGuessLength || !isValidGuessText(word) || state.closeHitSent.has(normalized)) return false;
+        devLog('chat', `Close-hit detected: "${word}" — resending without dot`);
+        if (canSendWithoutSpamKick()) {
+          if (sendGuess(word, { noDot: true })) {
+            state.closeHitSent.add(normalized);
+            state.closeHitPending = null;
+            renderTopCandidates();
+            return true;
+          }
+        } else {
+          enqueueCloseRetry(word);
+          return true;
+        }
+        return false;
       }
 
-      extractAndTrackGuessedWords(recent);
-    }
+      // Primary close-hit check: the current delta.
+      tryCloseHitSend(recent);
 
-    function extractAndTrackGuessedWords(chatText) {
-      const wordPattern = /(?:guessed the word|said:|:)\s+([a-z\s\-']+)/gi;
-      let match;
-      let guessedCount = 0;
-
-      while ((match = wordPattern.exec(chatText)) !== null) {
-        const guessedWord = match[1].trim().toLowerCase();
-        if (guessedWord && guessedWord.length > 1 && !guessedWord.includes('guessed') && !guessedWord.includes('said')) {
-          const normalized = normalizeWord(guessedWord);
-          if (!state.sentThisRound.has(normalized)) {
-            state.sentThisRound.add(normalized);
-            guessedCount++;
+      // Round-chat fallback: scan everything since this round started for any close-hit
+      // that landed in a previously skipped batch. roundStartChatLen keeps this safe
+      // (we never look at previous rounds' history).
+      if (!state.wordGuessedThisRound) {
+        const roundChat = fullText.slice(state.roundStartChatLen);
+        if (roundChat.length > recent.length) {
+          const closeRe = /\s*(?:\.)?([^\s.!?,]+(?:\s+[^\s.!?,]+)*)\s+is\s+close!/gi;
+          let cm;
+          while ((cm = closeRe.exec(roundChat)) !== null) {
+            const w = cm[1].trim().replace(/^\.+/, '');
+            const n = normalizeWord(w);
+            if (n && n.length >= LIMITS.minGuessLength && isValidGuessText(w) && !state.closeHitSent.has(n)) {
+              devLog('chat', `Close-hit detected (round-scan): "${w}" — resending without dot`);
+              if (canSendWithoutSpamKick()) {
+                if (sendGuess(w, { noDot: true })) {
+                  state.closeHitSent.add(n);
+                  state.closeHitPending = null;
+                  renderTopCandidates();
+                }
+              } else {
+                enqueueCloseRetry(w);
+              }
+              break;
+            }
           }
         }
       }
+      // ── End close-hit detection ───────────────────────────────────────────────
 
-      if (guessedCount > 0) {
-        renderTopCandidates();
+      const ownName = getSelfName();
+
+      // "You guessed the word!" is a system message (no "name: " prefix).
+      // Require no colon in the 15 chars before it so player chat like
+      // "bugatti: you guessed the word!" doesn't trigger a false positive.
+      const ownGuessIdx = recent.indexOf('you guessed the word!');
+      const isOwnGuessSysMsg = ownGuessIdx !== -1 &&
+        !recent.slice(Math.max(0, ownGuessIdx - 15), ownGuessIdx).includes(':');
+
+      const ownSolved = isOwnGuessSysMsg ||
+        (ownName && new RegExp(`\\b${escapeRegExp(ownName)}\\s+guessed the word!`, 'i').test(recent));
+
+      const ownDrawing = ownName && (
+        new RegExp(`\\b${escapeRegExp(ownName)}\\s+is drawing now!`, 'i').test(recent) ||
+        new RegExp(`\\b${escapeRegExp(ownName)}\\s+is choosing a word`, 'i').test(recent)
+      );
+
+      if (ownSolved || ownDrawing) {
+        devLog('chat', ownSolved
+          ? `You guessed the word! Stopping automation.`
+          : `You are drawing now. Stopping automation.`);
+        state.wordGuessedThisRound = true;
+        state.wordGuessedAt = Date.now();
+        hideCandidates();
+        if (state.running) {
+          stopAutomation('Solved word detected, stopped');
+        }
+        // If the next round's transition signal arrived in the SAME delta (common when
+        // guessing + "X is drawing now!" are batched), process it before returning so
+        // the new round isn't silently missed.
+        if (/\bis drawing now\b|\bis choosing a word\b|\bchoose a word\b|\bpick a word\b/.test(recent)) {
+          startNewRound();
+        }
+        return;
       }
+
+      const transitionRe = /\bis drawing now\b|\bis choosing a word\b|\bchoose a word\b|\bpick a word\b/;
+      if (transitionRe.test(recent)) {
+        const wordWasRe = /\bthe word was\s*'([^']+)'/gi;
+        let m;
+        while ((m = wordWasRe.exec(fullText)) !== null) {
+          const w = normalizeWord(m[1]);
+          if (w && w.length >= LIMITS.minGuessLength) {
+            state.revealedWords.add(w);
+            state.closeHitSent.add(w);
+          }
+        }
+        startNewRound();
+      } else if (state.wordGuessedThisRound) {
+        // Fallback: scan this round's full chat for a transition signal that may have been
+        // missed in a previous delta batch (same pattern as the close-hit fallback).
+        // Safe because roundStartChatLen is reset each new round.
+        const roundChat = fullText.slice(state.roundStartChatLen);
+        if (roundChat.length > recent.length && transitionRe.test(roundChat)) {
+          devLog('round', 'Transition fallback: found missed "is drawing now" in round chat');
+          startNewRound();
+        }
+      }
+
     }
   
   
@@ -4719,8 +5079,27 @@
     }
   
     function hideCandidates() {
+      if (state.renderTopCandidatesRaf != null) {
+        cancelAnimationFrame(state.renderTopCandidatesRaf);
+        state.renderTopCandidatesRaf = null;
+        state.renderTopCandidatesPending = null;
+      }
       if (state.ui?.candidateTop) {
-        state.ui.candidateTop.innerHTML = '<div style="padding:8px;text-align:center;color:#999;font-size:10px;">Word guessed! Waiting for next round...</div>';
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'padding:8px;text-align:center;color:#999;font-size:10px;';
+        wrap.innerHTML = 'Word guessed! Waiting for next round… ';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.textContent = 'Not guessed? Show words';
+        btn.style.cssText = 'margin-left:4px;padding:2px 6px;font-size:10px;cursor:pointer;';
+        btn.addEventListener('click', () => {
+          state.wordGuessedThisRound = false;
+          refreshCandidates('force-show');
+          devLog('info', 'Show words (recover) triggered');
+        });
+        wrap.appendChild(btn);
+        state.ui.candidateTop.innerHTML = '';
+        state.ui.candidateTop.appendChild(wrap);
       }
     }
 
@@ -4735,9 +5114,41 @@
       }).slice(0, LIMITS.candidatePreview);
     }
 
+    function measureWidestCharWidthPx() {
+      const panel = state.ui?.panel;
+      const fontFamily = (panel && getComputedStyle(panel).fontFamily) ? getComputedStyle(panel).fontFamily : 'Arial,sans-serif';
+      let span = document.getElementById('sag-measure-span');
+      if (!span) {
+        span = document.createElement('span');
+        span.id = 'sag-measure-span';
+        span.setAttribute('aria-hidden', 'true');
+        span.style.cssText = 'position:absolute;left:-9999px;top:0;visibility:hidden;pointer-events:none;white-space:nowrap;font:12px/1.35 Arial,sans-serif';
+        document.body.appendChild(span);
+      }
+      span.style.font = fontFamily;
+      span.style.fontSize = '100px';
+      span.textContent = 'm';
+      return span.offsetWidth / 100;
+    }
+
     function renderTopCandidates(filteredCandidates = null, keepSearchActive = false) {
+      state.renderTopCandidatesPending = [filteredCandidates, keepSearchActive];
+      if (state.renderTopCandidatesRaf != null) return;
+      state.renderTopCandidatesRaf = requestAnimationFrame(() => {
+        state.renderTopCandidatesRaf = null;
+        const pending = state.renderTopCandidatesPending;
+        state.renderTopCandidatesPending = null;
+        if (pending) renderTopCandidatesImmediate(pending[0], pending[1]);
+      });
+    }
+
+    function renderTopCandidatesImmediate(filteredCandidates, keepSearchActive) {
       if (!state.ui?.candidateTop) return;
-  
+      if (state.wordGuessedThisRound) {
+        hideCandidates();
+        return;
+      }
+
       const candidates = filteredCandidates || filterCandidates('');
       if (!candidates.length) {
         state.ui.candidateTop.innerHTML = '<div style="padding:8px;text-align:center;color:#999;font-size:10px;">No matches</div>';
@@ -4749,7 +5160,7 @@
       
       state.ui.candidateTop.innerHTML = '';
       const container = document.createElement('div');
-      container.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fit,minmax(70px,1fr));gap:6px;height:162px;overflow-y:scroll;padding:6px;border:1px solid #e5e7eb;border-radius:4px;align-content:start;';
+      container.style.cssText = 'display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:6px;height:186px;overflow-y:scroll;padding:6px;border:1px solid #e5e7eb;border-radius:4px;align-content:start;width:100%;box-sizing:border-box;';
       
       container.addEventListener('scroll', () => {
         state.isUserScrolling = true;
@@ -4759,38 +5170,26 @@
         }, 500);
       });
       
+      const paddingPx = 14;
+      const minFontPx = 9;
+      const maxFontPx = 18;
+      const wrapThreshold = 14;
+
       candidates.forEach((word, index) => {
-        const wordLength = word.length;
-        let fontSize, padding, minHeight;
-        
-        if (wordLength < 5) {
-          fontSize = '13px';
-          padding = '6px';
-          minHeight = '32px';
-        } else if (wordLength < 8) {
-          fontSize = '11px';
-          padding = '6px';
-          minHeight = '32px';
-        } else if (wordLength < 12) {
-          fontSize = '9px';
-          padding = '6px';
-          minHeight = '36px';
-        } else if (wordLength < 16) {
-          fontSize = '8px';
-          padding = '8px';
-          minHeight = '40px';
-        } else {
-          fontSize = '7px';
-          padding = '8px';
-          minHeight = '44px';
-        }
-        
+        const wordLength = Math.max(1, word.length);
+        const allowWrap = wordLength > wrapThreshold;
+        const padding = wordLength >= 16 ? '10px' : '8px';
+        const minHeight = allowWrap ? '48px' : (wordLength >= 16 ? '48px' : (wordLength >= 12 ? '40px' : '36px'));
+
         const box = document.createElement('button');
         box.type = 'button';
-        box.style.cssText = `padding:${padding};font-size:${fontSize};border:1px solid #cbd5e1;border-radius:3px;background:#f8fafc;cursor:pointer;word-break:break-word;text-align:center;line-height:1.2;color:#111827;font-weight:500;min-height:${minHeight};`;
+        const wrapStyle = allowWrap ? 'white-space:normal;word-break:break-word;overflow:hidden;' : 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;';
+        box.style.cssText = `padding:${padding};font-size:${minFontPx}px;border:1px solid #cbd5e1;border-radius:3px;background:#f8fafc;cursor:pointer;${wrapStyle}text-align:center;line-height:1.2;color:#111827;font-weight:500;min-height:${minHeight};`;
         box.textContent = word;
         box.title = `${index + 1}. ${word}`;
-        
+        box.dataset.wordLength = String(wordLength);
+        box.dataset.allowWrap = allowWrap ? '1' : '0';
+
         box.addEventListener('mouseenter', () => {
           box.style.background = '#e5e7eb';
         });
@@ -4801,6 +5200,15 @@
         box.addEventListener('click', () => {
           sendGuess(word);
           state.sentThisRound.add(normalizeWord(word));
+          // Reset the automation timer so the next auto-send is exactly one delay after
+          // this click — prevents both immediate double-fires and overly long gaps.
+          if (state.running) {
+            if (state.loopTimer) {
+              clearTimeout(state.loopTimer);
+              state.loopTimer = null;
+            }
+            scheduleNextTick(getConfiguredDelay());
+          }
           if (!keepSearchActive) {
             renderTopCandidates();
           }
@@ -4811,8 +5219,39 @@
       
       state.ui.candidateTop.appendChild(container);
       container.scrollTop = savedScrollTop;
+
+      function fitWordFontSizes() {
+        const firstCell = container.querySelector('button');
+        const cellWidth = firstCell ? firstCell.offsetWidth : 100;
+        const rawAvailable = Math.max(28, cellWidth - paddingPx);
+        const availableWidth = rawAvailable * 0.94;
+        const pxPerChar = measureWidestCharWidthPx();
+        container.querySelectorAll('button').forEach((box) => {
+          const L = parseInt(box.dataset.wordLength, 10) || 1;
+          const allowWrap = box.dataset.allowWrap === '1';
+          let maxFont;
+          if (allowWrap) {
+            const charsPerLine = Math.max(1, Math.floor(L / 2));
+            maxFont = pxPerChar > 0 ? Math.floor(availableWidth / (charsPerLine * pxPerChar)) : maxFontPx;
+          } else {
+            maxFont = pxPerChar > 0 ? Math.floor(availableWidth / (L * pxPerChar)) : maxFontPx;
+          }
+          const fontSize = Math.max(minFontPx, Math.min(maxFontPx, maxFont));
+          box.style.fontSize = `${fontSize}px`;
+        });
+      }
+      fitWordFontSizes();
+
+      function runFitAfterLayout() {
+        requestAnimationFrame(() => requestAnimationFrame(fitWordFontSizes));
+      }
+
+      if (typeof ResizeObserver !== 'undefined') {
+        const ro = new ResizeObserver(() => runFitAfterLayout());
+        ro.observe(container);
+      }
     }
-  
+
     function attachObservers() {
       if (state.observers.hint) state.observers.hint.disconnect();
       if (state.observers.chat) state.observers.chat.disconnect();
@@ -4838,7 +5277,7 @@
           const token = `${roundText}::${phase}`;
           
           if (state.roundToken && token !== state.roundToken && /between-words|between-rounds|choosing/.test(phase)) {
-            resetRoundState('Word/round DOM changed');
+            startNewRound();
           }
           
           if (!state.roundToken || token !== state.roundToken) {
@@ -4853,6 +5292,22 @@
       }
     }
   
+    function devLog(category, message) {
+      const ts = new Date().toLocaleTimeString('en-GB', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+      const entry = { ts, category, message: String(message) };
+      state.devLog.push(entry);
+      if (state.devLog.length > LIMITS.devLogMax) state.devLog.shift();
+      if (state.ui?.devLogEl) {
+        const line = document.createElement('div');
+        line.style.cssText = 'border-bottom:1px solid #f0f0f0;padding:2px 0;line-height:1.4;';
+        const catColors = { hint: '#7c3aed', chat: '#0284c7', guess: '#16a34a', round: '#d97706', error: '#dc2626', info: '#6b7280' };
+        const color = catColors[category] || '#6b7280';
+        line.innerHTML = `<span style="color:#9ca3af;font-size:9px;">${ts}</span> <span style="color:${color};font-weight:700;font-size:9px;">[${category}]</span> <span style="font-size:10px;">${entry.message}</span>`;
+        state.ui.devLogEl.appendChild(line);
+        state.ui.devLogEl.scrollTop = state.ui.devLogEl.scrollHeight;
+      }
+    }
+
     function renderDebug(context) {
       if (!state.ui) return;
       state.ui.hintRaw.textContent = state.currentHintRaw || '—';
@@ -4865,41 +5320,59 @@
       state.ui.closeState.textContent = state.closeHitPending ? `pending: ${state.closeHitPending}` : 'none';
       state.ui.cooldown.textContent = state.cooldownRemainingMs > 0 ? `${Math.ceil(state.cooldownRemainingMs / 1000)}s` : '0s';
       state.ui.context.textContent = context;
+      // Compact hint bar: "_t____ (1t5)"
+      if (state.ui.hintCompact) {
+        const raw = state.currentHintRaw || '';
+        const pat = state.currentLetterPattern || '';
+        state.ui.hintCompact.textContent = raw ? `${raw}${pat ? ` (${pat})` : ''}` : '—';
+      }
+      if (state.ui.devNickname) {
+        // Always do a fresh DOM scan so the dev panel shows the live detected value
+        const savedCache = state.selfName;
+        state.selfName = '';
+        const name = getSelfName() || '(not detected)';
+        if (!name || name === '(not detected)') state.selfName = savedCache;
+        state.ui.devNickname.textContent = name;
+      }
     }
   
-    function makeDraggable(panel, handle) {
+    // options: { xKey, yKey } — which settings keys to save position into
+    function makeDraggable(panel, handle, onDragCallback, options) {
+      options = options || {};
+      const xKey = options.xKey || 'panelX';
+      const yKey = options.yKey || 'panelY';
       let dragging = false;
       let startX = 0;
       let startY = 0;
-  
+
       const onMove = (e) => {
         if (!dragging) return;
         const x = e.clientX - startX;
         const y = e.clientY - startY;
-        
         const panelWidth = panel.offsetWidth;
         const panelHeight = panel.offsetHeight;
         const maxX = Math.max(0, window.innerWidth - panelWidth);
         const maxY = Math.max(0, window.innerHeight - panelHeight);
-        
         const constrainedX = Math.max(0, Math.min(x, maxX));
         const constrainedY = Math.max(0, Math.min(y, maxY));
-        
         panel.style.left = `${constrainedX}px`;
         panel.style.top = `${constrainedY}px`;
         panel.style.right = 'auto';
-        settings.panelX = constrainedX;
-        settings.panelY = constrainedY;
+        settings[xKey] = constrainedX;
+        settings[yKey] = constrainedY;
         saveSettings();
+        if (onDragCallback) onDragCallback(constrainedX, constrainedY);
       };
-  
+
       const onUp = () => {
         dragging = false;
         window.removeEventListener('mousemove', onMove);
         window.removeEventListener('mouseup', onUp);
       };
-  
+
       handle.addEventListener('mousedown', (e) => {
+        // Don't initiate drag when clicking buttons/inputs inside the header
+        if (e.target !== handle && (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT')) return;
         dragging = true;
         const rect = panel.getBoundingClientRect();
         startX = e.clientX - rect.left;
@@ -4908,6 +5381,97 @@
         window.addEventListener('mouseup', onUp);
         e.preventDefault();
       });
+    }
+
+    // Supports all 8 resize directions: n, s, e, w, ne, nw, se, sw.
+    // North/west drags move the panel's top/left while adjusting size, so the
+    // opposite edge stays anchored — just like a native window resize.
+    function makeResizable(panel, handles, onResize, options) {
+      options = options || {};
+      const sizeLimits = options.limits || PANEL_SIZE;
+      const widthKey = options.widthKey || 'panelWidth';
+      const heightKey = options.heightKey || 'panelHeight';
+      const xKey = options.xKey || 'panelX';
+      const yKey = options.yKey || 'panelY';
+
+      let resizing = false;
+      let dir = 'se';
+      let startX = 0, startY = 0;
+      let startW = 0, startH = 0, startLeft = 0, startTop = 0;
+
+      function startResize(e, d) {
+        e.preventDefault();
+        e.stopPropagation();
+        resizing = true;
+        dir = d;
+        startX = e.clientX;
+        startY = e.clientY;
+        startW = panel.offsetWidth;
+        startH = panel.offsetHeight;
+        const rect = panel.getBoundingClientRect();
+        startLeft = rect.left;
+        startTop = rect.top;
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+      }
+
+      function onMove(e) {
+        if (!resizing) return;
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+        const maxH = Math.min(sizeLimits.maxHeight || 1200, window.innerHeight * 0.95);
+        const minW = sizeLimits.minWidth;
+        const maxW = sizeLimits.maxWidth || 9999;
+        const minH = sizeLimits.minHeight;
+
+        let w = startW, h = startH, left = startLeft, top = startTop;
+
+        // East / West
+        if (dir === 'e' || dir === 'se' || dir === 'ne') {
+          w = Math.max(minW, Math.min(maxW, startW + dx));
+        }
+        if (dir === 'w' || dir === 'sw' || dir === 'nw') {
+          w = Math.max(minW, Math.min(maxW, startW - dx));
+          // Move left edge; clamp so panel stays on screen
+          left = startLeft + (startW - w);
+        }
+
+        // South / North
+        if (dir === 's' || dir === 'se' || dir === 'sw') {
+          h = Math.max(minH, Math.min(maxH, startH + dy));
+        }
+        if (dir === 'n' || dir === 'ne' || dir === 'nw') {
+          h = Math.max(minH, Math.min(maxH, startH - dy));
+          top = startTop + (startH - h);
+        }
+
+        panel.style.width = `${w}px`;
+        panel.style.height = `${h}px`;
+        panel.style.left = `${left}px`;
+        panel.style.top = `${top}px`;
+        panel.style.right = 'auto';
+        if (onResize) onResize(w, h);
+      }
+
+      function onUp() {
+        if (!resizing) return;
+        resizing = false;
+        window.removeEventListener('mousemove', onMove);
+        window.removeEventListener('mouseup', onUp);
+        settings[widthKey] = panel.offsetWidth;
+        settings[heightKey] = panel.offsetHeight;
+        // Save position in case a north/west drag moved the panel
+        const rect = panel.getBoundingClientRect();
+        settings[xKey] = rect.left;
+        settings[yKey] = rect.top;
+        saveSettings();
+      }
+
+      if (Array.isArray(handles)) {
+        handles.forEach(({ el, dir: d }) => el && el.addEventListener('mousedown', (e) => startResize(e, d)));
+      } else if (handles) {
+        handles.addEventListener('mousedown', (e) => startResize(e, 'se'));
+      }
     }
 
     function ensurePanelVisible(panel) {
@@ -4939,6 +5503,10 @@
     function createPanel() {
       const panel = document.createElement('div');
       panel.id = 'skribbl-auto-guesser-panel';
+      const w = Math.max(PANEL_SIZE.minWidth, Math.min(PANEL_SIZE.maxWidth, settings.panelWidth || 320));
+      const h = settings.panelHeight != null
+        ? Math.max(PANEL_SIZE.minHeight, Math.min(PANEL_SIZE.maxHeight || 1200, settings.panelHeight))
+        : 'auto';
       panel.style.cssText = [
         'position:fixed',
         'z-index:2147483647',
@@ -4948,19 +5516,46 @@
         'box-shadow:0 8px 24px rgba(15,23,42,.18)',
         'color:#1f2937',
         'font:12px/1.35 Arial,sans-serif',
-        'width:320px',
-        'max-height:80vh',
-        'overflow:auto',
+        `width:${w}px`,
+        'min-width:' + PANEL_SIZE.minWidth + 'px',
+        'max-height:90vh',
+        'overflow:hidden',
         'padding:8px',
+        'box-sizing:border-box',
+        'display:flex',
+        'flex-direction:column',
         settings.panelX != null && settings.panelY != null
           ? `left:${settings.panelX}px;top:${settings.panelY}px`
           : 'top:12px;right:12px',
       ].join(';');
+      if (h !== 'auto') {
+        panel.style.height = h + 'px';
+      }
   
       const style = document.createElement('style');
       style.textContent = `
         #skribbl-auto-guesser-panel {
           color: #111827 !important;
+        }
+        #skribbl-auto-guesser-panel #sag-body {
+          flex: 1;
+          min-height: 0;
+          overflow: auto;
+        }
+        #skribbl-auto-guesser-panel .sag-resize-edge {
+          pointer-events: auto;
+        }
+        #skribbl-auto-guesser-panel .sag-resize-edge:hover {
+          background: rgba(59, 130, 246, 0.15);
+        }
+        #skribbl-auto-guesser-panel #sag-search-section {
+          width: 100%;
+          min-width: 0;
+        }
+        #skribbl-auto-guesser-panel #sag-candidate-top {
+          display: block;
+          width: 100%;
+          min-width: 0;
         }
         #skribbl-auto-guesser-panel strong,
         #skribbl-auto-guesser-panel span,
@@ -4972,6 +5567,39 @@
           color: #111827 !important;
           background: #ffffff !important;
           border: 1px solid #94a3b8 !important;
+        }
+        /* Hide real checkbox; custom box is in .sag-dot-box so page styles can't override */
+        #skribbl-auto-guesser-panel #sag-dot {
+          position: absolute !important;
+          width: 1px !important;
+          height: 1px !important;
+          margin: -1px !important;
+          padding: 0 !important;
+          overflow: hidden !important;
+          clip: rect(0,0,0,0) !important;
+          border: 0 none !important;
+          appearance: none !important;
+          -webkit-appearance: none !important;
+        }
+        #skribbl-auto-guesser-panel .sag-dot-box {
+          display: inline-block !important;
+          width: 16px !important;
+          height: 16px !important;
+          flex-shrink: 0 !important;
+          border: 2px solid #94a3b8 !important;
+          border-radius: 3px !important;
+          background-color: #fff !important;
+          background-image: none !important;
+          box-sizing: border-box !important;
+          vertical-align: middle !important;
+        }
+        #skribbl-auto-guesser-panel #sag-dot:checked + .sag-dot-box {
+          background-color: #2563eb !important;
+          background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='%23fff' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round' d='M2 8l4 4 8-8'/%3E%3C/svg%3E") !important;
+          background-repeat: no-repeat !important;
+          background-position: center !important;
+          background-size: 12px !important;
+          border-color: #2563eb !important;
         }
         #skribbl-auto-guesser-panel button {
           border: 1px solid #cbd5e1 !important;
@@ -5010,6 +5638,117 @@
           background: #0ea5e9 !important;
           color: #ffffff !important;
           border-color: #0284c7 !important;
+        }
+        #skribbl-auto-guesser-panel #sag-dev-toggle {
+          background: #6d28d9 !important;
+          color: #ffffff !important;
+          border-color: #5b21b6 !important;
+        }
+        #skribbl-auto-guesser-panel #sag-refresh-rate {
+          -webkit-appearance: none;
+          appearance: none;
+          background: transparent;
+          height: 22px;
+        }
+        #skribbl-auto-guesser-panel #sag-refresh-rate::-webkit-slider-runnable-track {
+          width: 100%;
+          height: 6px;
+          background: #e5e7eb;
+          border-radius: 3px;
+        }
+        #skribbl-auto-guesser-panel #sag-refresh-rate::-webkit-slider-thumb {
+          -webkit-appearance: none;
+          appearance: none;
+          width: 18px;
+          height: 18px;
+          border-radius: 50%;
+          background: #2563eb;
+          margin-top: -6px;
+          cursor: pointer;
+        }
+        #skribbl-auto-guesser-panel #sag-refresh-rate::-moz-range-track {
+          width: 100%;
+          height: 6px;
+          background: #e5e7eb;
+          border-radius: 3px;
+        }
+        #skribbl-auto-guesser-panel #sag-refresh-rate::-moz-range-thumb {
+          width: 18px;
+          height: 18px;
+          border-radius: 50%;
+          background: #2563eb;
+          border: none;
+          cursor: pointer;
+        }
+        #skribbl-auto-guesser-panel #sag-closehit-scan {
+          -webkit-appearance: none;
+          appearance: none;
+          background: transparent;
+          height: 22px;
+        }
+        #skribbl-auto-guesser-panel #sag-closehit-scan::-webkit-slider-runnable-track {
+          width: 100%;
+          height: 6px;
+          background: #e5e7eb;
+          border-radius: 3px;
+        }
+        #skribbl-auto-guesser-panel #sag-closehit-scan::-webkit-slider-thumb {
+          -webkit-appearance: none;
+          appearance: none;
+          width: 18px;
+          height: 18px;
+          border-radius: 50%;
+          background: #16a34a;
+          margin-top: -6px;
+          cursor: pointer;
+        }
+        #skribbl-auto-guesser-panel #sag-closehit-scan::-moz-range-track {
+          width: 100%;
+          height: 6px;
+          background: #e5e7eb;
+          border-radius: 3px;
+        }
+        #skribbl-auto-guesser-panel #sag-closehit-scan::-moz-range-thumb {
+          width: 18px;
+          height: 18px;
+          border-radius: 50%;
+          background: #16a34a;
+          border: none;
+          cursor: pointer;
+        }
+        #skribbl-auto-guesser-dev-panel {
+          color: #111827 !important;
+        }
+        #skribbl-auto-guesser-dev-panel button {
+          border: 1px solid #cbd5e1 !important;
+          border-radius: 6px !important;
+          font-weight: 700 !important;
+          cursor: pointer !important;
+          color: #111827 !important;
+          background: #f8fafc !important;
+        }
+        #skribbl-auto-guesser-dev-panel #sag-dev-force-hide {
+          background: #dc2626 !important;
+          color: #ffffff !important;
+          border-color: #b91c1c !important;
+        }
+        #skribbl-auto-guesser-dev-panel #sag-dev-force-show {
+          background: #16a34a !important;
+          color: #ffffff !important;
+          border-color: #15803d !important;
+        }
+        #skribbl-auto-guesser-dev-panel #sag-dev-snap {
+          background: #0ea5e9 !important;
+          color: #ffffff !important;
+          border-color: #0284c7 !important;
+        }
+        #skribbl-auto-guesser-dev-panel #sag-dev-new-round {
+          background: #d97706 !important;
+          color: #ffffff !important;
+          border-color: #b45309 !important;
+        }
+        #skribbl-auto-guesser-dev-panel .sag-resize-edge:hover {
+          background: rgba(59, 130, 246, 0.15);
         }
   
         #skribbl-auto-guesser-panel .sag-candidate-chip {
@@ -5060,7 +5799,7 @@
   
       panel.innerHTML = `
         <div id="sag-header" style="display:flex;align-items:center;justify-content:space-between;cursor:move;gap:8px;margin-bottom:6px;">
-          <strong>Skribbl Auto Guesser</strong>
+          <strong>Skribbl Auto Guesser <span style="font-weight:400;font-size:11px;color:#6b7280;">${SCRIPT_VERSION}</span></strong>
           <button id="sag-collapse" style="border:1px solid #cbd5e1;background:#f8fafc;border-radius:6px;padding:2px 6px;cursor:pointer;">${settings.collapsed ? '+' : '−'}</button>
         </div>
         <div id="sag-body" style="display:${settings.collapsed ? 'none' : 'block'};">
@@ -5069,69 +5808,265 @@
             <button id="sag-stop" style="padding:5px 10px;">Stop</button>
             <button id="sag-refresh" style="padding:5px 10px;">Refresh parse</button>
           </div>
-          <label style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">Delay (ms)
-            <input id="sag-delay" type="number" min="${LIMITS.delayMin}" max="${LIMITS.delayMax}" value="${settings.delayMs}" style="width:90px;" />
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;">
-            <input id="sag-dot" type="checkbox" ${settings.dotPrefix ? 'checked' : ''} /> Prefix with dot
-          </label>
-          <div style="display:flex;gap:4px;align-items:center;margin-bottom:8px;flex-wrap:wrap;">
-            <input id="sag-word-input" type="text" placeholder="word" style="flex:1;min-width:100px;padding:3px 5px;" />
-            <button id="sag-add-word" style="padding:4px 8px;">Add</button>
-            <button id="sag-remove-word" style="padding:4px 8px;">Remove</button>
-            <button id="sag-dedupe" style="padding:4px 8px;">Dedupe</button>
+          <div style="display:flex;gap:10px;align-items:center;margin-bottom:6px;flex-wrap:wrap;">
+            <label style="display:flex;align-items:center;gap:4px;font-size:11px;">
+              Delay (ms)
+              <input id="sag-delay-input" type="number" min="0" max="8000" step="50" value="${settings.delayMs}" style="width:64px;padding:2px 4px;font-size:11px;border:1px solid #cbd5e1;border-radius:4px;" />
+            </label>
+            <label style="display:flex;align-items:center;gap:4px;cursor:pointer;">
+              <input id="sag-dot" type="checkbox" ${settings.dotPrefix ? 'checked' : ''} />
+              <span class="sag-dot-box"></span>
+              Dot prefix
+            </label>
           </div>
 
-          <div id="sag-search-section" style="margin-bottom:8px;">
+          <!-- Compact hint bar -->
+          <div style="font-size:11px;padding:4px 8px;background:#f0f9ff;border:1px solid #bae6fd;border-radius:4px;margin-bottom:6px;font-family:monospace;letter-spacing:0.5px;">
+            Hint: <span id="sag-hint-compact" style="font-weight:700;color:#0369a1;">—</span>
+          </div>
+
+          <div id="sag-search-section" style="margin-bottom:6px;">
             <input id="sag-search-input" type="text" placeholder="Search words (type 1-9 or Enter to send)" />
             <div id="sag-search-hint" style="display:none;">Press 1-9 for first 9 results, Enter for first result</div>
             <span id="sag-candidate-top">—</span>
           </div>
-  
-          <div style="font-size:11px;display:grid;grid-template-columns:120px 1fr;gap:3px 6px;word-break:break-word;">
-            <span>Status</span><span id="sag-status">Idle</span>
-            <span>Raw hint</span><span id="sag-hint-raw">—</span>
-            <span>Underscore pattern</span><span id="sag-hint-normalized">—</span>
-            <span>Letter pattern</span><span id="sag-letter-pattern">—</span>
-            <span>Word list size</span><span id="sag-word-count">0</span>
-            <span>Candidate count</span><span id="sag-candidate-count">0</span>
-            <span>Last sent guess</span><span id="sag-last-guess">—</span>
-            <span>Mode</span><span id="sag-mode">stopped</span>
-            <span>Game phase</span><span id="sag-phase">unknown</span>
-            <span>Close-hit</span><span id="sag-close">none</span>
-            <span>Spam cooldown</span><span id="sag-cooldown">0s</span>
-            <span>Context</span><span id="sag-context">init</span>
+
+          <!-- Details toggle -->
+          <button id="sag-details-toggle" style="width:100%;padding:3px;font-size:10px;margin-bottom:4px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px;cursor:pointer;text-align:center;">${settings.detailsCollapsed ? 'Show details ▼' : 'Hide details ▲'}</button>
+
+          <div id="sag-details" style="display:${settings.detailsCollapsed ? 'none' : 'block'};">
+            <div style="font-size:11px;display:grid;grid-template-columns:110px 1fr;gap:3px 6px;word-break:break-word;margin-bottom:6px;">
+              <span>Status</span><span id="sag-status">Idle</span>
+              <span>Raw hint</span><span id="sag-hint-raw">—</span>
+              <span>Underscore</span><span id="sag-hint-normalized">—</span>
+              <span>Letter pattern</span><span id="sag-letter-pattern">—</span>
+              <span>Word list size</span><span id="sag-word-count">0</span>
+              <span>Candidates</span><span id="sag-candidate-count">0</span>
+              <span>Last guess</span><span id="sag-last-guess">—</span>
+              <span>Mode</span><span id="sag-mode">stopped</span>
+              <span>Game phase</span><span id="sag-phase">unknown</span>
+              <span>Close-hit</span><span id="sag-close">none</span>
+              <span>Spam cooldown</span><span id="sag-cooldown">0s</span>
+              <span>Context</span><span id="sag-context">init</span>
+            </div>
+
+            <!-- Add/Remove word (moved here) -->
+            <div style="display:flex;gap:4px;align-items:center;margin-bottom:8px;flex-wrap:wrap;">
+              <input id="sag-word-input" type="text" placeholder="word" style="flex:1;min-width:80px;padding:3px 5px;" />
+              <button id="sag-add-word" style="padding:4px 8px;">Add</button>
+              <button id="sag-remove-word" style="padding:4px 8px;">Remove</button>
+              <button id="sag-dedupe" style="padding:4px 8px;">Dedupe</button>
+            </div>
+
+            <!-- Refresh rate slider: controls how fast the bot polls for hint/chat changes -->
+            <div style="margin-bottom:6px;">
+              <div style="display:flex;align-items:center;justify-content:space-between;font-size:11px;margin-bottom:2px;">
+                <span>Bot refresh rate:</span>
+                <strong id="sag-refresh-rate-val">${settings.refreshRateMs ?? DEFAULT_SETTINGS.refreshRateMs}ms</strong>
+              </div>
+              <div class="sag-range-wrap" style="width:100%;box-sizing:border-box;display:flex;justify-content:center;">
+                <input id="sag-refresh-rate" class="sag-range" type="range" min="50" max="2000" step="50" value="${settings.refreshRateMs ?? DEFAULT_SETTINGS.refreshRateMs}" style="width:calc(100% - 32px);max-width:100%;cursor:pointer;display:block;box-sizing:content-box;" />
+              </div>
+              <div style="display:flex;justify-content:space-between;font-size:9px;color:#9ca3af;margin-top:2px;">
+                <span>Fast (50ms)</span><span>Slow (2000ms)</span>
+              </div>
+            </div>
+
+            <!-- Close-hit scan slider: how fast the watcher polls for ".word is close!" after a dot-send -->
+            <div style="margin-bottom:6px;">
+              <div style="display:flex;align-items:center;justify-content:space-between;font-size:11px;margin-bottom:2px;">
+                <span>Close-hit scan rate:</span>
+                <strong id="sag-closehit-scan-val">${settings.closeHitScanMs ?? DEFAULT_SETTINGS.closeHitScanMs}ms</strong>
+              </div>
+              <div class="sag-range-wrap" style="width:100%;box-sizing:border-box;display:flex;justify-content:center;">
+                <input id="sag-closehit-scan" class="sag-range" type="range" min="10" max="200" step="10" value="${settings.closeHitScanMs ?? DEFAULT_SETTINGS.closeHitScanMs}" style="width:calc(100% - 32px);max-width:100%;cursor:pointer;display:block;box-sizing:content-box;" />
+              </div>
+              <div style="display:flex;justify-content:space-between;font-size:9px;color:#9ca3af;margin-top:2px;">
+                <span>Fast (10ms)</span><span>Slow (200ms)</span>
+              </div>
+            </div>
+
+            <!-- Dev Panel toggle -->
+            <div style="display:flex;align-items:center;justify-content:space-between;">
+              <strong style="font-size:11px;">🛠 Developer Panel</strong>
+              <button id="sag-dev-toggle" style="padding:2px 8px;font-size:10px;">Show</button>
+            </div>
           </div>
+          <!-- Resize edges: all 8 directions -->
+          <div id="sag-resize-n"  class="sag-resize-edge" style="position:absolute;top:0;left:8px;right:8px;height:6px;cursor:ns-resize;z-index:10;"></div>
+          <div id="sag-resize-s"  class="sag-resize-edge" style="position:absolute;bottom:0;left:8px;right:8px;height:6px;cursor:ns-resize;z-index:10;"></div>
+          <div id="sag-resize-e"  class="sag-resize-edge" style="position:absolute;top:8px;right:0;bottom:8px;width:6px;cursor:ew-resize;z-index:10;"></div>
+          <div id="sag-resize-w"  class="sag-resize-edge" style="position:absolute;top:8px;left:0;bottom:8px;width:6px;cursor:ew-resize;z-index:10;"></div>
+          <div id="sag-resize-nw" class="sag-resize-edge" style="position:absolute;top:0;left:0;width:12px;height:12px;cursor:nwse-resize;z-index:11;"></div>
+          <div id="sag-resize-ne" class="sag-resize-edge" style="position:absolute;top:0;right:0;width:12px;height:12px;cursor:nesw-resize;z-index:11;"></div>
+          <div id="sag-resize-sw" class="sag-resize-edge" style="position:absolute;bottom:0;left:0;width:12px;height:12px;cursor:nesw-resize;z-index:11;"></div>
+          <div id="sag-resize-se" class="sag-resize-edge" style="position:absolute;bottom:0;right:0;width:12px;height:12px;cursor:nwse-resize;z-index:11;"></div>
         </div>
       `;
   
+      // ── Side developer panel (separate floating div, resizable) ──────────
+      const devPanel = document.createElement('div');
+      devPanel.id = 'skribbl-auto-guesser-dev-panel';
+      const devW = Math.max(DEV_PANEL_SIZE.minWidth, Math.min(DEV_PANEL_SIZE.maxWidth, settings.devPanelWidth || 300));
+      const devH = Math.max(DEV_PANEL_SIZE.minHeight, Math.min(DEV_PANEL_SIZE.maxHeight || 1200, settings.devPanelHeight || 420));
+      devPanel.style.cssText = [
+        'position:fixed',
+        'z-index:2147483647',
+        'background:#fff',
+        'border:1px solid #d0d7de',
+        'border-radius:10px',
+        'box-shadow:0 8px 24px rgba(15,23,42,.18)',
+        'color:#1f2937',
+        'font:12px/1.35 Arial,sans-serif',
+        `width:${devW}px`,
+        `height:${devH}px`,
+        'min-width:' + DEV_PANEL_SIZE.minWidth + 'px',
+        'overflow:hidden',
+        'padding:8px',
+        'box-sizing:border-box',
+        'display:none',
+        'flex-direction:column',
+        'flex',
+      ].join(';');
+
+      devPanel.innerHTML = `
+        <div id="sag-dev-content" style="flex:1;min-height:0;overflow:auto;">
+          <div id="sag-dev-header" style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;cursor:move;user-select:none;">
+            <strong style="font-size:12px;">🛠 Developer Panel</strong>
+            <button id="sag-dev-close" style="padding:2px 7px;font-size:11px;background:#f8fafc;border:1px solid #cbd5e1;border-radius:5px;cursor:pointer;">✕</button>
+          </div>
+          <div style="font-size:11px;margin-bottom:6px;padding:4px 6px;background:#f8fafc;border:1px solid #e5e7eb;border-radius:4px;">
+            Your nickname: <strong id="sag-dev-nickname" style="color:#2563eb;">(not detected)</strong>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:4px;margin-bottom:6px;">
+            <button id="sag-dev-snap" style="padding:3px 8px;font-size:10px;">Snapshot state</button>
+            <button id="sag-dev-force-hide" style="padding:3px 8px;font-size:10px;">Force hide words</button>
+            <button id="sag-dev-force-show" style="padding:3px 8px;font-size:10px;">Force show words</button>
+            <button id="sag-dev-clear-sent" style="padding:3px 8px;font-size:10px;">Clear sent set</button>
+            <button id="sag-dev-new-round" style="padding:3px 8px;font-size:10px;">Simulate new round</button>
+            <button id="sag-dev-clear-log" style="padding:3px 8px;font-size:10px;">Clear log</button>
+            <button id="sag-dev-copy-log" style="padding:3px 8px;font-size:10px;">Copy log</button>
+          </div>
+          <div id="sag-dev-snap-out" style="display:none;font-size:9px;font-family:monospace;background:#f1f5f9;border:1px solid #e2e8f0;border-radius:4px;padding:6px;margin-bottom:6px;max-height:80px;overflow-y:auto;word-break:break-all;white-space:pre-wrap;"></div>
+          <div style="font-size:10px;font-weight:700;color:#374151;margin-bottom:3px;">Bot log</div>
+          <div id="sag-dev-log" style="height:280px;overflow-y:auto;background:#f9fafb;border:1px solid #e5e7eb;border-radius:4px;padding:4px 6px;font-family:monospace;"></div>
+        </div>
+        <div id="sag-dev-resize-n"  class="sag-resize-edge" style="position:absolute;top:0;left:8px;right:8px;height:6px;cursor:ns-resize;z-index:10;"></div>
+        <div id="sag-dev-resize-s"  class="sag-resize-edge" style="position:absolute;bottom:0;left:8px;right:8px;height:6px;cursor:ns-resize;z-index:10;"></div>
+        <div id="sag-dev-resize-e"  class="sag-resize-edge" style="position:absolute;top:8px;right:0;bottom:8px;width:6px;cursor:ew-resize;z-index:10;"></div>
+        <div id="sag-dev-resize-w"  class="sag-resize-edge" style="position:absolute;top:8px;left:0;bottom:8px;width:6px;cursor:ew-resize;z-index:10;"></div>
+        <div id="sag-dev-resize-nw" class="sag-resize-edge" style="position:absolute;top:0;left:0;width:12px;height:12px;cursor:nwse-resize;z-index:11;"></div>
+        <div id="sag-dev-resize-ne" class="sag-resize-edge" style="position:absolute;top:0;right:0;width:12px;height:12px;cursor:nesw-resize;z-index:11;"></div>
+        <div id="sag-dev-resize-sw" class="sag-resize-edge" style="position:absolute;bottom:0;left:0;width:12px;height:12px;cursor:nesw-resize;z-index:11;"></div>
+        <div id="sag-dev-resize-se" class="sag-resize-edge" style="position:absolute;bottom:0;right:0;width:12px;height:12px;cursor:nwse-resize;z-index:11;"></div>
+      `;
+      document.body.appendChild(devPanel);
+
+      // Position dev panel: use saved position if the user moved it, otherwise auto-place
+      // beside the main panel. Called once on open and never after (dev panel is freely draggable).
+      function repositionDevPanel() {
+        if (settings.devPanelX != null && settings.devPanelY != null) {
+          // Clamp to viewport in case the window was resized since last session
+          const dw = devPanel.offsetWidth || devW;
+          const dh = devPanel.offsetHeight || devH;
+          const x = Math.max(0, Math.min(settings.devPanelX, window.innerWidth - dw));
+          const y = Math.max(0, Math.min(settings.devPanelY, window.innerHeight - dh));
+          devPanel.style.left = `${x}px`;
+          devPanel.style.top = `${y}px`;
+          devPanel.style.right = 'auto';
+          return;
+        }
+        // No saved position — auto-place to the right (or left) of the main panel
+        const mainRect = panel.getBoundingClientRect();
+        const gap = 8;
+        const dw = devPanel.offsetWidth || devW;
+        let left = mainRect.right + gap;
+        if (left + dw > window.innerWidth) {
+          left = Math.max(0, mainRect.left - dw - gap);
+        }
+        const top = Math.min(mainRect.top, window.innerHeight - devPanel.offsetHeight - 10);
+        devPanel.style.left = `${left}px`;
+        devPanel.style.top = `${Math.max(0, top)}px`;
+        devPanel.style.right = 'auto';
+      }
+
+      // Dev panel resize (same edge/corner behavior as main panel)
+      // Dev panel: all-sides resize
+      makeResizable(devPanel, [
+        { el: devPanel.querySelector('#sag-dev-resize-n'),  dir: 'n' },
+        { el: devPanel.querySelector('#sag-dev-resize-s'),  dir: 's' },
+        { el: devPanel.querySelector('#sag-dev-resize-e'),  dir: 'e' },
+        { el: devPanel.querySelector('#sag-dev-resize-w'),  dir: 'w' },
+        { el: devPanel.querySelector('#sag-dev-resize-nw'), dir: 'nw' },
+        { el: devPanel.querySelector('#sag-dev-resize-ne'), dir: 'ne' },
+        { el: devPanel.querySelector('#sag-dev-resize-sw'), dir: 'sw' },
+        { el: devPanel.querySelector('#sag-dev-resize-se'), dir: 'se' },
+      ], null, {
+        limits: DEV_PANEL_SIZE,
+        widthKey: 'devPanelWidth',
+        heightKey: 'devPanelHeight',
+        xKey: 'devPanelX',
+        yKey: 'devPanelY',
+      });
+
+      // Dev panel: draggable by its title bar
+      const devHeader = devPanel.querySelector('#sag-dev-header');
+      makeDraggable(devPanel, devHeader, null, { xKey: 'devPanelX', yKey: 'devPanelY' });
+
       document.body.appendChild(panel);
       ensurePanelVisible(panel);
   
       const header = panel.querySelector('#sag-header');
       makeDraggable(panel, header);
+      // Main panel: all-sides resize
+      makeResizable(panel, [
+        { el: panel.querySelector('#sag-resize-n'),  dir: 'n' },
+        { el: panel.querySelector('#sag-resize-s'),  dir: 's' },
+        { el: panel.querySelector('#sag-resize-e'),  dir: 'e' },
+        { el: panel.querySelector('#sag-resize-w'),  dir: 'w' },
+        { el: panel.querySelector('#sag-resize-nw'), dir: 'nw' },
+        { el: panel.querySelector('#sag-resize-ne'), dir: 'ne' },
+        { el: panel.querySelector('#sag-resize-sw'), dir: 'sw' },
+        { el: panel.querySelector('#sag-resize-se'), dir: 'se' },
+      ]);
   
       const body = panel.querySelector('#sag-body');
       const collapse = panel.querySelector('#sag-collapse');
-      const delayInput = panel.querySelector('#sag-delay');
       const dotToggle = panel.querySelector('#sag-dot');
       const wordInput = panel.querySelector('#sag-word-input');
-  
+
       collapse.addEventListener('click', () => {
         settings.collapsed = !settings.collapsed;
         body.style.display = settings.collapsed ? 'none' : 'block';
         collapse.textContent = settings.collapsed ? '+' : '−';
         saveSettings();
       });
-  
-      delayInput.addEventListener('change', () => {
-        const parsed = Number(delayInput.value);
-        const value = Number.isFinite(parsed)
-          ? Math.max(LIMITS.delayMin, Math.min(LIMITS.delayMax, parsed))
-          : DEFAULT_SETTINGS.delayMs;
-        settings.delayMs = value;
-        delayInput.value = String(value);
+
+      // Details collapse toggle — resize panel to fit content when toggling
+      const detailsToggle = panel.querySelector('#sag-details-toggle');
+      const detailsEl = panel.querySelector('#sag-details');
+      function fitPanelHeightToContent() {
+        requestAnimationFrame(() => {
+          const prevHeight = panel.style.height;
+          const prevMaxHeight = panel.style.maxHeight;
+          panel.style.height = 'auto';
+          panel.style.maxHeight = 'none';
+          const contentHeight = panel.getBoundingClientRect().height;
+          panel.style.height = prevHeight;
+          panel.style.maxHeight = prevMaxHeight;
+          const maxH = Math.min(PANEL_SIZE.maxHeight || 1200, Math.floor(window.innerHeight * 0.95));
+          const h = Math.max(PANEL_SIZE.minHeight, Math.min(maxH, contentHeight));
+          panel.style.height = h + 'px';
+          settings.panelHeight = h;
+          saveSettings();
+        });
+      }
+      detailsToggle.addEventListener('click', () => {
+        settings.detailsCollapsed = !settings.detailsCollapsed;
+        detailsEl.style.display = settings.detailsCollapsed ? 'none' : 'block';
+        detailsToggle.textContent = settings.detailsCollapsed ? 'Show details ▼' : 'Hide details ▲';
         saveSettings();
+        fitPanelHeightToContent();
       });
   
       dotToggle.addEventListener('change', () => {
@@ -5215,11 +6150,127 @@
         }
       });
   
+      // Guess delay — number input (main panel only)
+      const delayInput = panel.querySelector('#sag-delay-input');
+      delayInput.value = String(settings.delayMs ?? DEFAULT_SETTINGS.delayMs);
+      delayInput.addEventListener('change', () => {
+        const v = Number(delayInput.value);
+        settings.delayMs = Math.max(LIMITS.delayMin, Math.min(LIMITS.delayMax, Number.isFinite(v) ? v : DEFAULT_SETTINGS.delayMs));
+        delayInput.value = String(settings.delayMs);
+        saveSettings();
+      });
+
+      // Refresh rate slider — controls the hint/chat polling interval (NOT guess delay)
+      // Close-hit resends are always immediate regardless of this setting.
+      const refreshRateSlider = panel.querySelector('#sag-refresh-rate');
+      const refreshRateVal = panel.querySelector('#sag-refresh-rate-val');
+      const initRR = Math.max(LIMITS.refreshRateMin, Math.min(LIMITS.refreshRateMax, settings.refreshRateMs ?? DEFAULT_SETTINGS.refreshRateMs));
+      refreshRateSlider.value = String(initRR);
+      refreshRateVal.textContent = `${initRR}ms`;
+      refreshRateSlider.addEventListener('input', () => {
+        const ms = Number(refreshRateSlider.value);
+        settings.refreshRateMs = ms;
+        refreshRateVal.textContent = `${ms}ms`;
+        saveSettings();
+      });
+
+      // Close-hit scan slider — controls how fast the watcher polls for ".word is close!"
+      // after a dot-prefixed guess is sent. Lower = faster detection, but slightly more CPU.
+      const closeHitScanSlider = panel.querySelector('#sag-closehit-scan');
+      const closeHitScanVal = panel.querySelector('#sag-closehit-scan-val');
+      const initCHS = Math.max(LIMITS.closeHitScanMin, Math.min(LIMITS.closeHitScanMax, settings.closeHitScanMs ?? DEFAULT_SETTINGS.closeHitScanMs));
+      closeHitScanSlider.value = String(initCHS);
+      closeHitScanVal.textContent = `${initCHS}ms`;
+      closeHitScanSlider.addEventListener('input', () => {
+        const ms = Number(closeHitScanSlider.value);
+        settings.closeHitScanMs = ms;
+        closeHitScanVal.textContent = `${ms}ms`;
+        saveSettings();
+      });
+
+      // Dev panel toggle (in main panel)
+      const devToggle = panel.querySelector('#sag-dev-toggle');
+      const showDev = settings.devPanelOpen ?? false;
+      devPanel.style.display = showDev ? 'flex' : 'none';
+      devToggle.textContent = showDev ? 'Hide' : 'Show';
+      if (showDev) setTimeout(repositionDevPanel, 0);
+
+      function toggleDevPanel(open) {
+        devPanel.style.display = open ? 'flex' : 'none';
+        devToggle.textContent = open ? 'Hide' : 'Show';
+        settings.devPanelOpen = open;
+        saveSettings();
+        if (open) { repositionDevPanel(); renderDebug('dev panel open'); }
+      }
+
+      devToggle.addEventListener('click', () => toggleDevPanel(devPanel.style.display === 'none'));
+      devPanel.querySelector('#sag-dev-close').addEventListener('click', () => toggleDevPanel(false));
+
+      // Dev panel buttons
+      devPanel.querySelector('#sag-dev-snap').addEventListener('click', () => {
+        const snap = {
+          running: state.running,
+          wordGuessedThisRound: state.wordGuessedThisRound,
+          selfName: getSelfName(),
+          phase: state.lastGamePhase,
+          candidates: state.candidates.length,
+          sentThisRound: [...state.sentThisRound],
+          lastGuess: state.lastGuess,
+          rawHint: state.currentHintRaw,
+          underscorePattern: state.currentUnderscorePattern,
+          letterPattern: state.currentLetterPattern,
+          queueLen: state.queue.length,
+          delayMs: settings.delayMs,
+          refreshRateMs: settings.refreshRateMs,
+          closeHitScanMs: settings.closeHitScanMs,
+        };
+        const snapOut = devPanel.querySelector('#sag-dev-snap-out');
+        snapOut.style.display = 'block';
+        snapOut.textContent = JSON.stringify(snap, null, 2);
+        devLog('info', 'State snapshot taken');
+      });
+
+      devPanel.querySelector('#sag-dev-force-hide').addEventListener('click', () => {
+        state.wordGuessedThisRound = true;
+        hideCandidates();
+        devLog('info', 'Force-hide triggered');
+      });
+
+      devPanel.querySelector('#sag-dev-force-show').addEventListener('click', () => {
+        state.wordGuessedThisRound = false;
+        refreshCandidates('force-show');
+        devLog('info', 'Force-show triggered');
+      });
+
+      devPanel.querySelector('#sag-dev-clear-sent').addEventListener('click', () => {
+        state.sentThisRound.clear();
+        renderTopCandidates();
+        devLog('info', `Cleared sentThisRound set`);
+      });
+
+      devPanel.querySelector('#sag-dev-new-round').addEventListener('click', () => {
+        startNewRound();
+        devLog('round', 'Simulated new round');
+      });
+
+      devPanel.querySelector('#sag-dev-clear-log').addEventListener('click', () => {
+        state.devLog = [];
+        const logEl = devPanel.querySelector('#sag-dev-log');
+        if (logEl) logEl.innerHTML = '';
+      });
+
+      devPanel.querySelector('#sag-dev-copy-log').addEventListener('click', () => {
+        const text = state.devLog.map(e => `[${e.ts}] [${e.category}] ${e.message}`).join('\n');
+        navigator.clipboard?.writeText(text).then(() => devLog('info', 'Log copied to clipboard'));
+      });
+
       state.ui = {
         panel,
+        devPanel,
         status: panel.querySelector('#sag-status'),
         hintRaw: panel.querySelector('#sag-hint-raw'),
         hintNormalized: panel.querySelector('#sag-hint-normalized'),
+        hintCompact: panel.querySelector('#sag-hint-compact'),
         letterPattern: panel.querySelector('#sag-letter-pattern'),
         wordCount: panel.querySelector('#sag-word-count'),
         candidateCount: panel.querySelector('#sag-candidate-count'),
@@ -5230,6 +6281,8 @@
         closeState: panel.querySelector('#sag-close'),
         cooldown: panel.querySelector('#sag-cooldown'),
         context: panel.querySelector('#sag-context'),
+        devNickname: devPanel.querySelector('#sag-dev-nickname'),
+        devLogEl: devPanel.querySelector('#sag-dev-log'),
       };
     }
   
@@ -5262,15 +6315,78 @@
       }
 
       let lastRenderedHint = '';
-      setInterval(() => {
-        if (state.initialized && state.ui && !state.wordGuessedThisRound && !state.isUserScrolling) {
-          const currentHint = getHintText() || '';
-          if (currentHint && currentHint !== lastRenderedHint) {
-            lastRenderedHint = currentHint;
-            refreshCandidates('auto-refresh-hint-change');
-          }
+      if (state.refreshLoopScheduled != null) {
+        clearTimeout(state.refreshLoopScheduled);
+        state.refreshLoopScheduled = null;
+      }
+      // Tertiary safety net: periodically check the game phase regardless of observers.
+      // Only fires after a grace period (10 s) since the word was guessed, because
+      // skribbl stays in "guessing" phase while other players are still guessing — we
+      // must not mistake that for a missed round transition.
+      (function phasePoller() {
+        if (
+          state.initialized &&
+          state.wordGuessedThisRound &&
+          getGamePhase() === 'guessing' &&
+          Date.now() - state.wordGuessedAt > 10000
+        ) {
+          devLog('round', 'Phase poller: guessing phase while word-guessed — auto-recovering');
+          startNewRound();
         }
-      }, 100);
+        setTimeout(phasePoller, 800);
+      })();
+
+      (function scheduleHintRefresh() {
+        // Use settings.refreshRateMs so the slider actually controls the polling speed.
+        // The close-hit scan also runs on every tick, so lower = faster close-hit detection.
+        // Clamped to [50, 2000] to prevent accidental freeze or runaway CPU usage.
+        const rate = Math.max(LIMITS.refreshRateMin, Math.min(LIMITS.refreshRateMax, settings.refreshRateMs ?? DEFAULT_SETTINGS.refreshRateMs));
+        state.refreshLoopScheduled = setTimeout(() => {
+          state.refreshLoopScheduled = null;
+
+          if (state.initialized && state.ui && !state.isUserScrolling) {
+            // Always run even when wordGuessedThisRound=true — auto-recovery inside
+            // refreshCandidates depends on being called when a new round hint appears.
+            const currentHint = getHintText() || '';
+            if (currentHint && currentHint !== lastRenderedHint) {
+              lastRenderedHint = currentHint;
+              refreshCandidates('auto-refresh-hint-change');
+            }
+
+            // Proactive close-hit scan: the chat MutationObserver may fire after a chat
+            // message arrives, but if nobody chats for seconds, a ".word is close!" sitting
+            // in the DOM would go unnoticed until the next delta. Poll the round's chat
+            // directly every 100ms so the resend fires within one tick, not seconds later.
+            if (!state.wordGuessedThisRound && state.selectors.chat) {
+              const fullChatText = state.selectors.chat.textContent || '';
+              const roundChat = fullChatText.slice(state.roundStartChatLen || 0);
+              if (roundChat) {
+                const closeRe = /\s*(?:\.)?([^\s.!?,]+(?:\s+[^\s.!?,]+)*)\s+is\s+close!/gi;
+                let cm;
+                while ((cm = closeRe.exec(roundChat)) !== null) {
+                  const w = cm[1].trim().replace(/^\.+/, '');
+                  const n = normalizeWord(w);
+                  if (n && n.length >= LIMITS.minGuessLength && isValidGuessText(w) && !state.closeHitSent.has(n)) {
+                    devLog('chat', `Close-hit detected (poller): "${w}" — resending without dot`);
+                    if (canSendWithoutSpamKick()) {
+                      if (sendGuess(w, { noDot: true })) {
+                        state.closeHitSent.add(n);
+                        state.closeHitPending = null;
+                        renderTopCandidates();
+                      }
+                    } else {
+                      enqueueCloseRetry(w);
+                    }
+                    break;
+                  }
+                }
+              }
+            }
+          }
+
+          scheduleHintRefresh();
+        }, rate);
+      })();
     }
   
     onReady(async () => {
