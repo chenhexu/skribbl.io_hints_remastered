@@ -84,6 +84,13 @@ npm run dev
 - **Language**: TypeScript
 - **API**: Next.js API Routes for word management
 
+## Chrome Extension (Skribbl Auto Guesser)
+
+The **skribbl-auto-guesser-extension/** folder contains the Chrome Web Store version of the Auto Guesser: it runs only on skribbl.io, parses hints, and suggests or auto-sends guesses. See that folder’s [README](skribbl-auto-guesser-extension/README.md) for loading unpacked and publishing.
+
+- **License:** [LICENSE](LICENSE) (MIT)
+- **Privacy:** [PRIVACY.md](PRIVACY.md) (extension does not collect user data)
+
 ## Project Structure
 
 ```
@@ -109,7 +116,7 @@ Contributions are welcome! Feel free to submit issues or pull requests.
 
 ## License
 
-MIT License - feel free to use this project for your own purposes.
+This project is licensed under the MIT License — see [LICENSE](LICENSE).
 
 ## Acknowledgments
 

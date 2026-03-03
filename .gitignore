@@ -52,3 +52,6 @@ tools/newwordList.txt
 start-skribbl.ps1
 start-skribbl.bat
 
+# Extension build artifact (zip for store upload)
+skribbl-auto-guesser-v1.0.0.zip
+
