@@ -86,7 +86,7 @@ npm run dev
 
 ## Chrome Extension (Skribbl Auto Guesser)
 
-The **skribbl-auto-guesser-extension/** folder contains the Chrome Web Store version of the Auto Guesser: it runs only on skribbl.io, parses hints, and suggests or auto-sends guesses. See that folder’s [README](skribbl-auto-guesser-extension/README.md) for loading unpacked and publishing.
+The extension is maintained as a **separate project** (sibling folder `skribbl-auto-guesser-extension`) so it can be versioned and extended (e.g. auto-drawer) independently. A copy of the extension files also lives in **skribbl-auto-guesser-extension/** in this repo for reference; the [README there](skribbl-auto-guesser-extension/README.md) points to the standalone project.
 
 - **License:** [LICENSE](LICENSE) (MIT)
 - **Privacy:** [PRIVACY.md](PRIVACY.md) (extension does not collect user data)

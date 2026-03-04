@@ -33,7 +33,7 @@
 
     const PANEL_SIZE = { minWidth: 260, minHeight: 200, maxWidth: 1400, maxHeight: 1200 };
     const DEV_PANEL_SIZE = { minWidth: 260, minHeight: 280, maxWidth: 1000, maxHeight: 1200 };
-    const SCRIPT_VERSION = 'v1.0.1';
+    const SCRIPT_VERSION = 'v1.0.0';
   
     const LIMITS = {
       delayMin: 0,
@@ -4449,7 +4449,9 @@
         // Only auto-recover after a grace period: skribbl stays in "guessing" phase
         // while other players are still guessing the same word, so we must not
         // mistake that window for a missed round transition.
-        const gracePassed = Date.now() - state.wordGuessedAt > 10000;
+        // 45 s covers a full skribbl round timer — the chat "the word was" signal
+        // should always arrive well before then if the round ends naturally.
+        const gracePassed = Date.now() - state.wordGuessedAt > 45000;
         if (gracePassed && rawHint && /_/.test(rawHint)) {
           devLog('round', `Auto-recovering: guessing phase while word-guessed (hint: "${rawHint}")`);
           startNewRound();
@@ -4524,6 +4526,20 @@
       if (state.loopTimer) {
         clearTimeout(state.loopTimer);
         state.loopTimer = null;
+      }
+      // Clear any pending candidate render and show a "stopped" placeholder
+      // so the word list doesn't linger after the bot is halted.
+      if (state.renderTopCandidatesRaf != null) {
+        cancelAnimationFrame(state.renderTopCandidatesRaf);
+        state.renderTopCandidatesRaf = null;
+        state.renderTopCandidatesPending = null;
+      }
+      if (state.ui?.candidateTop && !state.wordGuessedThisRound) {
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'padding:8px;text-align:center;color:#999;font-size:10px;';
+        wrap.textContent = 'Bot stopped. Click Start to resume.';
+        state.ui.candidateTop.innerHTML = '';
+        state.ui.candidateTop.appendChild(wrap);
       }
       setStatus(reason);
       renderDebug('stopped');
@@ -4600,12 +4616,11 @@
           if (found === normalized) {
             stopCloseHitWatch();
             devLog('chat', `Close-hit (watcher): "${cleaned}" — resending without dot`);
+            state.closeHitSent.add(normalized); // mark immediately to prevent re-detection
             if (canSendWithoutSpamKick()) {
-              if (sendGuess(cleaned, { noDot: true })) {
-                state.closeHitSent.add(normalized);
-                state.closeHitPending = null;
-                renderTopCandidates();
-              }
+              sendGuess(cleaned, { noDot: true });
+              state.closeHitPending = null;
+              renderTopCandidates();
             } else {
               enqueueCloseRetry(cleaned);
             }
@@ -4672,7 +4687,7 @@
       }
   
       state.lastGuess = out;
-      state.ui.lastGuess.textContent = out || '—';
+      state.ui.lastGuess.textContent = out || '-';
       state.sentThisRound.add(normalizeWord(out.replace(/^\./, '')));
       devLog('guess', `Sent: "${out}"`);
 
@@ -4844,7 +4859,7 @@
       state.lastProcessedHint = '';
       state.selfName = ''; // re-detect name each round in case it changed
       if (state.ui) {
-        state.ui.lastGuess.textContent = '—';
+        state.ui.lastGuess.textContent = '-';
       }
       if (state.running) {
         setStatus(`Running (paused: ${reason.toLowerCase()})`);
@@ -4944,18 +4959,17 @@
         const normalized = normalizeWord(word);
         if (!normalized || normalized.length < LIMITS.minGuessLength || !isValidGuessText(word) || state.closeHitSent.has(normalized)) return false;
         devLog('chat', `Close-hit detected: "${word}" — resending without dot`);
+        // Mark as handled immediately so no other detector re-fires for this word,
+        // even if the send is temporarily blocked by spam cooldown.
+        state.closeHitSent.add(normalized);
         if (canSendWithoutSpamKick()) {
-          if (sendGuess(word, { noDot: true })) {
-            state.closeHitSent.add(normalized);
-            state.closeHitPending = null;
-            renderTopCandidates();
-            return true;
-          }
+          sendGuess(word, { noDot: true });
+          state.closeHitPending = null;
+          renderTopCandidates();
         } else {
           enqueueCloseRetry(word);
-          return true;
         }
-        return false;
+        return true;
       }
 
       // Primary close-hit check: the current delta.
@@ -4974,12 +4988,11 @@
             const n = normalizeWord(w);
             if (n && n.length >= LIMITS.minGuessLength && isValidGuessText(w) && !state.closeHitSent.has(n)) {
               devLog('chat', `Close-hit detected (round-scan): "${w}" — resending without dot`);
+              state.closeHitSent.add(n); // mark immediately to prevent re-detection
               if (canSendWithoutSpamKick()) {
-                if (sendGuess(w, { noDot: true })) {
-                  state.closeHitSent.add(n);
-                  state.closeHitPending = null;
-                  renderTopCandidates();
-                }
+                sendGuess(w, { noDot: true });
+                state.closeHitPending = null;
+                renderTopCandidates();
               } else {
                 enqueueCloseRetry(w);
               }
@@ -5144,6 +5157,10 @@
 
     function renderTopCandidatesImmediate(filteredCandidates, keepSearchActive) {
       if (!state.ui?.candidateTop) return;
+      // Never re-render the word list while the bot is stopped — that would
+      // overwrite the "stopped" or "word guessed" placeholder with a fresh
+      // candidate grid every time the hint observer fires.
+      if (!state.running) return;
       if (state.wordGuessedThisRound) {
         hideCandidates();
         return;
@@ -5310,9 +5327,9 @@
 
     function renderDebug(context) {
       if (!state.ui) return;
-      state.ui.hintRaw.textContent = state.currentHintRaw || '—';
-      state.ui.hintNormalized.textContent = state.currentUnderscorePattern || '—';
-      state.ui.letterPattern.textContent = state.currentLetterPattern || '—';
+      state.ui.hintRaw.textContent = state.currentHintRaw || '-';
+      state.ui.hintNormalized.textContent = state.currentUnderscorePattern || '-';
+      state.ui.letterPattern.textContent = state.currentLetterPattern || '-';
       state.ui.wordCount.textContent = String(state.wordCount || state.words.length || 0);
       state.ui.candidateCount.textContent = String(state.candidates.length);
       state.ui.mode.textContent = state.running ? 'running' : 'stopped';
@@ -5324,7 +5341,7 @@
       if (state.ui.hintCompact) {
         const raw = state.currentHintRaw || '';
         const pat = state.currentLetterPattern || '';
-        state.ui.hintCompact.textContent = raw ? `${raw}${pat ? ` (${pat})` : ''}` : '—';
+        state.ui.hintCompact.textContent = raw ? `${raw}${pat ? ` (${pat})` : ''}` : '-';
       }
       if (state.ui.devNickname) {
         // Always do a fresh DOM scan so the dev panel shows the live detected value
@@ -5504,9 +5521,12 @@
       const panel = document.createElement('div');
       panel.id = 'skribbl-auto-guesser-panel';
       const w = Math.max(PANEL_SIZE.minWidth, Math.min(PANEL_SIZE.maxWidth, settings.panelWidth || 320));
-      const h = settings.panelHeight != null
-        ? Math.max(PANEL_SIZE.minHeight, Math.min(PANEL_SIZE.maxHeight || 1200, settings.panelHeight))
-        : 'auto';
+      const collapsedHeight = 44;
+      const h = settings.collapsed
+        ? collapsedHeight
+        : (settings.panelHeight != null
+            ? Math.max(PANEL_SIZE.minHeight, Math.min(PANEL_SIZE.maxHeight || 1200, settings.panelHeight))
+            : 'auto');
       panel.style.cssText = [
         'position:fixed',
         'z-index:2147483647',
@@ -5530,6 +5550,7 @@
       ].join(';');
       if (h !== 'auto') {
         panel.style.height = h + 'px';
+        if (settings.collapsed) panel.style.minHeight = collapsedHeight + 'px';
       }
   
       const style = document.createElement('style');
@@ -5800,7 +5821,7 @@
       panel.innerHTML = `
         <div id="sag-header" style="display:flex;align-items:center;justify-content:space-between;cursor:move;gap:8px;margin-bottom:6px;">
           <strong>Skribbl Auto Guesser <span style="font-weight:400;font-size:11px;color:#6b7280;">${SCRIPT_VERSION}</span></strong>
-          <button id="sag-collapse" style="border:1px solid #cbd5e1;background:#f8fafc;border-radius:6px;padding:2px 6px;cursor:pointer;">${settings.collapsed ? '+' : '−'}</button>
+          <button id="sag-collapse" style="border:1px solid #cbd5e1;background:#f8fafc;border-radius:6px;padding:2px 6px;cursor:pointer;">${settings.collapsed ? '+' : '-'}</button>
         </div>
         <div id="sag-body" style="display:${settings.collapsed ? 'none' : 'block'};">
           <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px;">
@@ -5822,27 +5843,27 @@
 
           <!-- Compact hint bar -->
           <div style="font-size:11px;padding:4px 8px;background:#f0f9ff;border:1px solid #bae6fd;border-radius:4px;margin-bottom:6px;font-family:monospace;letter-spacing:0.5px;">
-            Hint: <span id="sag-hint-compact" style="font-weight:700;color:#0369a1;">—</span>
+            Hint: <span id="sag-hint-compact" style="font-weight:700;color:#0369a1;">-</span>
           </div>
 
           <div id="sag-search-section" style="margin-bottom:6px;">
             <input id="sag-search-input" type="text" placeholder="Search words (type 1-9 or Enter to send)" />
             <div id="sag-search-hint" style="display:none;">Press 1-9 for first 9 results, Enter for first result</div>
-            <span id="sag-candidate-top">—</span>
+            <span id="sag-candidate-top">-</span>
           </div>
 
           <!-- Details toggle -->
-          <button id="sag-details-toggle" style="width:100%;padding:3px;font-size:10px;margin-bottom:4px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px;cursor:pointer;text-align:center;">${settings.detailsCollapsed ? 'Show details ▼' : 'Hide details ▲'}</button>
+          <button id="sag-details-toggle" style="width:100%;padding:3px;font-size:10px;margin-bottom:4px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:4px;cursor:pointer;text-align:center;">${settings.detailsCollapsed ? 'Show details v' : 'Hide details ^'}</button>
 
           <div id="sag-details" style="display:${settings.detailsCollapsed ? 'none' : 'block'};">
             <div style="font-size:11px;display:grid;grid-template-columns:110px 1fr;gap:3px 6px;word-break:break-word;margin-bottom:6px;">
               <span>Status</span><span id="sag-status">Idle</span>
-              <span>Raw hint</span><span id="sag-hint-raw">—</span>
-              <span>Underscore</span><span id="sag-hint-normalized">—</span>
-              <span>Letter pattern</span><span id="sag-letter-pattern">—</span>
+              <span>Raw hint</span><span id="sag-hint-raw">-</span>
+              <span>Underscore</span><span id="sag-hint-normalized">-</span>
+              <span>Letter pattern</span><span id="sag-letter-pattern">-</span>
               <span>Word list size</span><span id="sag-word-count">0</span>
               <span>Candidates</span><span id="sag-candidate-count">0</span>
-              <span>Last guess</span><span id="sag-last-guess">—</span>
+              <span>Last guess</span><span id="sag-last-guess">-</span>
               <span>Mode</span><span id="sag-mode">stopped</span>
               <span>Game phase</span><span id="sag-phase">unknown</span>
               <span>Close-hit</span><span id="sag-close">none</span>
@@ -5888,7 +5909,7 @@
 
             <!-- Dev Panel toggle -->
             <div style="display:flex;align-items:center;justify-content:space-between;">
-              <strong style="font-size:11px;">🛠 Developer Panel</strong>
+              <strong style="font-size:11px;">Developer Panel</strong>
               <button id="sag-dev-toggle" style="padding:2px 8px;font-size:10px;">Show</button>
             </div>
           </div>
@@ -5904,7 +5925,7 @@
         </div>
       `;
   
-      // ── Side developer panel (separate floating div, resizable) ──────────
+      // --- Side developer panel (separate floating div, resizable) ---
       const devPanel = document.createElement('div');
       devPanel.id = 'skribbl-auto-guesser-dev-panel';
       const devW = Math.max(DEV_PANEL_SIZE.minWidth, Math.min(DEV_PANEL_SIZE.maxWidth, settings.devPanelWidth || 300));
@@ -6035,10 +6056,21 @@
       const dotToggle = panel.querySelector('#sag-dot');
       const wordInput = panel.querySelector('#sag-word-input');
 
+      const COLLAPSED_PANEL_HEIGHT = 44;
       collapse.addEventListener('click', () => {
         settings.collapsed = !settings.collapsed;
         body.style.display = settings.collapsed ? 'none' : 'block';
-        collapse.textContent = settings.collapsed ? '+' : '−';
+        collapse.textContent = settings.collapsed ? '+' : '-';
+        if (settings.collapsed) {
+          panel.style.height = COLLAPSED_PANEL_HEIGHT + 'px';
+          panel.style.minHeight = COLLAPSED_PANEL_HEIGHT + 'px';
+        } else {
+          const restored = Math.max(PANEL_SIZE.minHeight, Math.min(PANEL_SIZE.maxHeight || 1200, settings.panelHeight || 400));
+          panel.style.height = restored + 'px';
+          panel.style.minHeight = PANEL_SIZE.minHeight + 'px';
+          settings.panelHeight = restored;
+          saveSettings();
+        }
         saveSettings();
       });
 
@@ -6320,15 +6352,17 @@
         state.refreshLoopScheduled = null;
       }
       // Tertiary safety net: periodically check the game phase regardless of observers.
-      // Only fires after a grace period (10 s) since the word was guessed, because
+      // Only fires after a 45 s grace period since the word was guessed, because
       // skribbl stays in "guessing" phase while other players are still guessing — we
       // must not mistake that for a missed round transition.
+      // 45 s covers the full skribbl round timer; "the word was" chat signals should
+      // always arrive before then if the round ends normally.
       (function phasePoller() {
         if (
           state.initialized &&
           state.wordGuessedThisRound &&
           getGamePhase() === 'guessing' &&
-          Date.now() - state.wordGuessedAt > 10000
+          Date.now() - state.wordGuessedAt > 45000
         ) {
           devLog('round', 'Phase poller: guessing phase while word-guessed — auto-recovering');
           startNewRound();
@@ -6353,35 +6387,6 @@
               refreshCandidates('auto-refresh-hint-change');
             }
 
-            // Proactive close-hit scan: the chat MutationObserver may fire after a chat
-            // message arrives, but if nobody chats for seconds, a ".word is close!" sitting
-            // in the DOM would go unnoticed until the next delta. Poll the round's chat
-            // directly every 100ms so the resend fires within one tick, not seconds later.
-            if (!state.wordGuessedThisRound && state.selectors.chat) {
-              const fullChatText = state.selectors.chat.textContent || '';
-              const roundChat = fullChatText.slice(state.roundStartChatLen || 0);
-              if (roundChat) {
-                const closeRe = /\s*(?:\.)?([^\s.!?,]+(?:\s+[^\s.!?,]+)*)\s+is\s+close!/gi;
-                let cm;
-                while ((cm = closeRe.exec(roundChat)) !== null) {
-                  const w = cm[1].trim().replace(/^\.+/, '');
-                  const n = normalizeWord(w);
-                  if (n && n.length >= LIMITS.minGuessLength && isValidGuessText(w) && !state.closeHitSent.has(n)) {
-                    devLog('chat', `Close-hit detected (poller): "${w}" — resending without dot`);
-                    if (canSendWithoutSpamKick()) {
-                      if (sendGuess(w, { noDot: true })) {
-                        state.closeHitSent.add(n);
-                        state.closeHitPending = null;
-                        renderTopCandidates();
-                      }
-                    } else {
-                      enqueueCloseRetry(w);
-                    }
-                    break;
-                  }
-                }
-              }
-            }
           }
 
           scheduleHintRefresh();

@@ -4441,7 +4441,9 @@
         // Only auto-recover after a grace period: skribbl stays in "guessing" phase
         // while other players are still guessing the same word, so we must not
         // mistake that window for a missed round transition.
-        const gracePassed = Date.now() - state.wordGuessedAt > 10000;
+        // 45 s covers a full skribbl round timer — the chat "the word was" signal
+        // should always arrive well before then if the round ends naturally.
+        const gracePassed = Date.now() - state.wordGuessedAt > 45000;
         if (gracePassed && rawHint && /_/.test(rawHint)) {
           devLog('round', `Auto-recovering: guessing phase while word-guessed (hint: "${rawHint}")`);
           startNewRound();
@@ -4516,6 +4518,20 @@
       if (state.loopTimer) {
         clearTimeout(state.loopTimer);
         state.loopTimer = null;
+      }
+      // Clear any pending candidate render and show a "stopped" placeholder
+      // so the word list doesn't linger after the bot is halted.
+      if (state.renderTopCandidatesRaf != null) {
+        cancelAnimationFrame(state.renderTopCandidatesRaf);
+        state.renderTopCandidatesRaf = null;
+        state.renderTopCandidatesPending = null;
+      }
+      if (state.ui?.candidateTop && !state.wordGuessedThisRound) {
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'padding:8px;text-align:center;color:#999;font-size:10px;';
+        wrap.textContent = 'Bot stopped. Click Start to resume.';
+        state.ui.candidateTop.innerHTML = '';
+        state.ui.candidateTop.appendChild(wrap);
       }
       setStatus(reason);
       renderDebug('stopped');
@@ -4592,12 +4608,11 @@
           if (found === normalized) {
             stopCloseHitWatch();
             devLog('chat', `Close-hit (watcher): "${cleaned}" — resending without dot`);
+            state.closeHitSent.add(normalized); // mark immediately to prevent re-detection
             if (canSendWithoutSpamKick()) {
-              if (sendGuess(cleaned, { noDot: true })) {
-                state.closeHitSent.add(normalized);
-                state.closeHitPending = null;
-                renderTopCandidates();
-              }
+              sendGuess(cleaned, { noDot: true });
+              state.closeHitPending = null;
+              renderTopCandidates();
             } else {
               enqueueCloseRetry(cleaned);
             }
@@ -4936,18 +4951,17 @@
         const normalized = normalizeWord(word);
         if (!normalized || normalized.length < LIMITS.minGuessLength || !isValidGuessText(word) || state.closeHitSent.has(normalized)) return false;
         devLog('chat', `Close-hit detected: "${word}" — resending without dot`);
+        // Mark as handled immediately so no other detector re-fires for this word,
+        // even if the send is temporarily blocked by spam cooldown.
+        state.closeHitSent.add(normalized);
         if (canSendWithoutSpamKick()) {
-          if (sendGuess(word, { noDot: true })) {
-            state.closeHitSent.add(normalized);
-            state.closeHitPending = null;
-            renderTopCandidates();
-            return true;
-          }
+          sendGuess(word, { noDot: true });
+          state.closeHitPending = null;
+          renderTopCandidates();
         } else {
           enqueueCloseRetry(word);
-          return true;
         }
-        return false;
+        return true;
       }
 
       // Primary close-hit check: the current delta.
@@ -4966,12 +4980,11 @@
             const n = normalizeWord(w);
             if (n && n.length >= LIMITS.minGuessLength && isValidGuessText(w) && !state.closeHitSent.has(n)) {
               devLog('chat', `Close-hit detected (round-scan): "${w}" — resending without dot`);
+              state.closeHitSent.add(n); // mark immediately to prevent re-detection
               if (canSendWithoutSpamKick()) {
-                if (sendGuess(w, { noDot: true })) {
-                  state.closeHitSent.add(n);
-                  state.closeHitPending = null;
-                  renderTopCandidates();
-                }
+                sendGuess(w, { noDot: true });
+                state.closeHitPending = null;
+                renderTopCandidates();
               } else {
                 enqueueCloseRetry(w);
               }
@@ -5136,6 +5149,10 @@
 
     function renderTopCandidatesImmediate(filteredCandidates, keepSearchActive) {
       if (!state.ui?.candidateTop) return;
+      // Never re-render the word list while the bot is stopped — that would
+      // overwrite the "stopped" or "word guessed" placeholder with a fresh
+      // candidate grid every time the hint observer fires.
+      if (!state.running) return;
       if (state.wordGuessedThisRound) {
         hideCandidates();
         return;
@@ -6327,15 +6344,17 @@
         state.refreshLoopScheduled = null;
       }
       // Tertiary safety net: periodically check the game phase regardless of observers.
-      // Only fires after a grace period (10 s) since the word was guessed, because
+      // Only fires after a 45 s grace period since the word was guessed, because
       // skribbl stays in "guessing" phase while other players are still guessing — we
       // must not mistake that for a missed round transition.
+      // 45 s covers the full skribbl round timer; "the word was" chat signals should
+      // always arrive before then if the round ends normally.
       (function phasePoller() {
         if (
           state.initialized &&
           state.wordGuessedThisRound &&
           getGamePhase() === 'guessing' &&
-          Date.now() - state.wordGuessedAt > 10000
+          Date.now() - state.wordGuessedAt > 45000
         ) {
           devLog('round', 'Phase poller: guessing phase while word-guessed — auto-recovering');
           startNewRound();
@@ -6360,35 +6379,6 @@
               refreshCandidates('auto-refresh-hint-change');
             }
 
-            // Proactive close-hit scan: the chat MutationObserver may fire after a chat
-            // message arrives, but if nobody chats for seconds, a ".word is close!" sitting
-            // in the DOM would go unnoticed until the next delta. Poll the round's chat
-            // directly every 100ms so the resend fires within one tick, not seconds later.
-            if (!state.wordGuessedThisRound && state.selectors.chat) {
-              const fullChatText = state.selectors.chat.textContent || '';
-              const roundChat = fullChatText.slice(state.roundStartChatLen || 0);
-              if (roundChat) {
-                const closeRe = /\s*(?:\.)?([^\s.!?,]+(?:\s+[^\s.!?,]+)*)\s+is\s+close!/gi;
-                let cm;
-                while ((cm = closeRe.exec(roundChat)) !== null) {
-                  const w = cm[1].trim().replace(/^\.+/, '');
-                  const n = normalizeWord(w);
-                  if (n && n.length >= LIMITS.minGuessLength && isValidGuessText(w) && !state.closeHitSent.has(n)) {
-                    devLog('chat', `Close-hit detected (poller): "${w}" — resending without dot`);
-                    if (canSendWithoutSpamKick()) {
-                      if (sendGuess(w, { noDot: true })) {
-                        state.closeHitSent.add(n);
-                        state.closeHitPending = null;
-                        renderTopCandidates();
-                      }
-                    } else {
-                      enqueueCloseRetry(w);
-                    }
-                    break;
-                  }
-                }
-              }
-            }
           }
 
           scheduleHintRefresh();
